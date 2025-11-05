@@ -10,7 +10,7 @@ mod server;
 mod http;
 mod metrics;
 mod util;
-mod legacy;
+mod lumina;
 
 use crate::server::serve_binary_rpc;
 use crate::http::serve_http;
@@ -67,7 +67,7 @@ async fn main() {
         })
     };
 
-    info!("lumen server started; press Ctrl-C to stop.");
+    info!("dazhbog server started; press Ctrl-C to stop.");
     tokio::signal::ctrl_c().await.expect("failed to install Ctrl-C handler");
     info!("shutting down...");
 

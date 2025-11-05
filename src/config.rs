@@ -22,9 +22,9 @@ pub struct Limits {
     // --- In-flight memory budgets ---
     pub per_connection_inflight_bytes: usize, // soft limit per connection for frame buffers
     pub global_inflight_bytes: usize,         // node-wide limit for all connections
-    // --- Legacy parser safety caps ---
-    pub legacy_max_cstr_bytes: usize, // cap for C-strings in legacy messages (paths, hostnames)
-    pub legacy_max_hash_bytes: usize, // cap for variable-length "mb_hash" (should be small; 16 is expected)
+    // --- Lumina parser safety caps ---
+    pub lumina_max_cstr_bytes: usize, // cap for C-strings in lumina messages (paths, hostnames)
+    pub lumina_max_hash_bytes: usize, // cap for variable-length "mb_hash" (should be small; 16 is expected)
 }
 
 #[derive(Clone, Debug)]
@@ -100,8 +100,8 @@ impl Default for Config {
                 max_data_bytes: 8 * 1024 * 1024, // 8 MiB per item
                 per_connection_inflight_bytes: 32 * 1024 * 1024, // 32 MiB
                 global_inflight_bytes: 512 * 1024 * 1024,        // 512 MiB
-                legacy_max_cstr_bytes: 4096, // 4 KiB cap for C-strings (paths, hostnames)
-                legacy_max_hash_bytes: 64,   // hashes expected 16 bytes; allow small slack
+                lumina_max_cstr_bytes: 4096, // 4 KiB cap for C-strings (paths, hostnames)
+                lumina_max_hash_bytes: 64,   // hashes expected 16 bytes; allow small slack
             },
             http: Some(Http { bind_addr: "127.0.0.1:8080".into() }),
             engine: Engine {
@@ -121,7 +121,7 @@ impl Default for Config {
             },
             lumina: Lumina {
                 bind_addr: "0.0.0.0:20667".into(),
-                server_name: "lumen".into(),
+                server_name: "dazhbog".into(),
                 allow_deletes: false,
                 get_history_limit: 0,
                 use_tls: false,
@@ -170,8 +170,8 @@ impl Config {
                     ("limits","max_data_bytes") => cfg.limits.max_data_bytes = parse!(usize_),
                     ("limits","per_connection_inflight_bytes") => cfg.limits.per_connection_inflight_bytes = parse!(usize_),
                     ("limits","global_inflight_bytes") => cfg.limits.global_inflight_bytes = parse!(usize_),
-                    ("limits","legacy_max_cstr_bytes") => cfg.limits.legacy_max_cstr_bytes = parse!(usize_),
-                    ("limits","legacy_max_hash_bytes") => cfg.limits.legacy_max_hash_bytes = parse!(usize_),
+                    ("limits","lumina_max_cstr_bytes") => cfg.limits.lumina_max_cstr_bytes = parse!(usize_),
+                    ("limits","lumina_max_hash_bytes") => cfg.limits.lumina_max_hash_bytes = parse!(usize_),
 
                     ("http","bind_addr") => { cfg.http.get_or_insert_with(|| super::config::Http { bind_addr: "".into() }).bind_addr = parse!(s); },
 

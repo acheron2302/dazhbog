@@ -30,18 +30,18 @@ impl Metrics {
             format!("# HELP {0} {1}\n# TYPE {0} counter\n{0} {2}\n", name, help, val)
         };
         let mut s = String::with_capacity(1024);
-        s.push_str(&g("lumen_pulls_total","Number of functions successfully pulled", self.pulls.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_pushes_total","Number of functions pushed", self.pushes.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_new_funcs_total","New unique functions inserted", self.new_funcs.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_queried_funcs_total","Requested function keys", self.queried_funcs.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_active_connections","Active binary RPC connections", self.active_connections.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_lumina_v0_4","Hello protocol versions 0..4", self.lumina_v0_4.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_lumina_v5p","Hello protocol versions >=5", self.lumina_v5p.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_errors_total","Errors", self.errors.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_timeouts_total","Timeouts", self.timeouts.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_index_overflows_total","Index insertion overflows (no overwrite)", self.index_overflows.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_append_failures_total","Database append operation failures", self.append_failures.load(Ordering::Relaxed)));
-        s.push_str(&g("lumen_decoder_rejects_total","Protocol decoder rejections due to size limits", self.decoder_rejects.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_pulls_total","Number of functions successfully pulled", self.pulls.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_pushes_total","Number of functions pushed", self.pushes.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_new_funcs_total","New unique functions inserted", self.new_funcs.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_queried_funcs_total","Requested function keys", self.queried_funcs.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_active_connections","Active binary RPC connections", self.active_connections.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_lumina_v0_4","Hello protocol versions 0..4", self.lumina_v0_4.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_lumina_v5p","Hello protocol versions >=5", self.lumina_v5p.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_errors_total","Errors", self.errors.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_timeouts_total","Timeouts", self.timeouts.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_index_overflows_total","Index insertion overflows (no overwrite)", self.index_overflows.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_append_failures_total","Database append operation failures", self.append_failures.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_decoder_rejects_total","Protocol decoder rejections due to size limits", self.decoder_rejects.load(Ordering::Relaxed)));
         s
     }
 }

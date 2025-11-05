@@ -10,9 +10,9 @@ use hyper_util::rt::TokioIo;
 use log::*;
 
 const HOME: &str = r#"<!doctype html>
-<html><head><title>lumen</title></head>
+<html><head><title>dazhbog</title></head>
 <body>
-<h3>lumen</h3>
+<h3>dazhbog</h3>
 <p>Ultra-fast private Lumina server.</p>
 <p>Metrics at <a href="/metrics">/metrics</a>.</p>
 </body></html>"#;

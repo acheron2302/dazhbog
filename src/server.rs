@@ -1,4 +1,4 @@
-use crate::{rpc::*, config::Config, db::Database, metrics::METRICS, util::hex_dump, legacy};
+use crate::{rpc::*, config::Config, db::Database, metrics::METRICS, util::hex_dump, lumina};
 use log::*;
 use std::{io, sync::Arc, time::{Duration, Instant}};
 use tokio::{
@@ -153,15 +153,15 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     let msg_type = hello_bytes[0];
     let payload = &hello_bytes[1..];
 
-    const LEGACY_MSG_HELLO: u8 = 0x0d;
-    let is_legacy = msg_type == LEGACY_MSG_HELLO;
+    const LUMINA_MSG_HELLO: u8 = 0x0d;
+    let is_lumina = msg_type == LUMINA_MSG_HELLO;
 
     // Parse hello according to protocol
-    let hello = if is_legacy {
-        debug!("Detected legacy Hello message (0x0d)");
-        match legacy::parse_legacy_hello(payload) {
+    let hello = if is_lumina {
+        debug!("Detected Lumina Hello message (0x0d)");
+        match lumina::parse_lumina_hello(payload) {
             Ok(v) => HelloReq { protocol_version: v.protocol_version, username: v.username, password: v.password },
-            Err(e) => { error!("Failed to parse legacy Hello: {}", e); write_all(&mut stream, &encode_fail(0, "invalid hello")).await?; return Ok(()); }
+            Err(e) => { error!("Failed to parse Lumina Hello: {}", e); write_all(&mut stream, &encode_fail(0, "invalid hello")).await?; return Ok(()); }
         }
     } else if msg_type == MSG_HELLO {
         debug!("Detected new Hello message (0x01)");
@@ -184,8 +184,8 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     }
 
     if hello.username != "guest" {
-        if is_legacy {
-            legacy::send_legacy_fail(&mut stream, 1, &format!("{}: invalid username or password. Try logging in with `guest` instead.", cfg.lumina.server_name)).await?;
+        if is_lumina {
+            lumina::send_lumina_fail(&mut stream, 1, &format!("{}: invalid username or password. Try logging in with `guest` instead.", cfg.lumina.server_name)).await?;
         } else {
             write_all(&mut stream, &encode_fail(1, &format!("{}: invalid username or password. Try logging in with `guest` instead.", cfg.lumina.server_name))).await?;
         }
@@ -193,13 +193,13 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     }
 
     // Protocol split: ≤4 expects empty OK; ≥5 expects HelloResult{features}
-    if is_legacy {
+    if is_lumina {
         if hello.protocol_version <= 4 {
-            legacy::send_legacy_ok(&mut stream).await?;
+            lumina::send_lumina_ok(&mut stream).await?;
         } else {
             let mut features = 0u32;
             if cfg.lumina.allow_deletes { features |= 0x02; }
-            legacy::send_legacy_hello_result(&mut stream, features).await?;
+            lumina::send_lumina_hello_result(&mut stream, features).await?;
         }
     } else {
         if hello.protocol_version <= 4 {
@@ -213,7 +213,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
     // --- Command loop: budgeted frame reads with command caps ---
     loop {
-        let frame = if is_legacy {
+        let frame = if is_lumina {
             match timeout(
                 Duration::from_millis(cfg.limits.command_timeout_ms),
                 read_multiproto_bounded(&mut stream, Some(true), cfg.limits.max_cmd_frame_bytes, &conn_budget, &global_budget)
@@ -223,7 +223,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 Ok(Err(e)) => { error!("read error: {}", e); return Ok(()); },
                 Err(_) => {
                     METRICS.timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    legacy::send_legacy_fail(&mut stream, 0, &format!("{} client idle for too long.\n", cfg.lumina.server_name)).await.ok();
+                    lumina::send_lumina_fail(&mut stream, 0, &format!("{} client idle for too long.\n", cfg.lumina.server_name)).await.ok();
                     return Ok(());
                 }
             }
@@ -246,8 +246,8 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         let frame_bytes = frame.as_slice();
 
         if frame_bytes.is_empty() {
-            if is_legacy {
-                legacy::send_legacy_fail(&mut stream, 0, &format!("{}: error: invalid data.\n", cfg.lumina.server_name)).await?;
+            if is_lumina {
+                lumina::send_lumina_fail(&mut stream, 0, &format!("{}: error: invalid data.\n", cfg.lumina.server_name)).await?;
             } else {
                 write_all(&mut stream, &encode_fail(0, &format!("{}: error: invalid data.\n", cfg.lumina.server_name))).await?;
             }
@@ -259,30 +259,30 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
         debug!("Incoming message: type=0x{:02x}, payload_size={}", typ, pld.len());
 
-        if is_legacy {
-            // --- Legacy command handling with caps ---
-            debug!("Legacy command received: 0x{:02x}", typ);
+        if is_lumina {
+            // --- Lumina command handling with caps ---
+            debug!("Lumina command received: 0x{:02x}", typ);
 
             match typ {
                 0x0e => { // PullMetadata
-                    let caps = legacy::LegacyCaps {
+                    let caps = lumina::LuminaCaps {
                         max_funcs: cfg.limits.max_pull_items,
                         max_name_bytes: cfg.limits.max_name_bytes,
                         max_data_bytes: cfg.limits.max_data_bytes,
-                        max_cstr_bytes: cfg.limits.legacy_max_cstr_bytes,
-                        max_hash_bytes: cfg.limits.legacy_max_hash_bytes,
+                        max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                        max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
                     };
 
-                    let pull_msg = match legacy::parse_legacy_pull_metadata(pld, caps) {
+                    let pull_msg = match lumina::parse_lumina_pull_metadata(pld, caps) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!("Failed to parse legacy PullMetadata: {}", e);
-                            legacy::send_legacy_fail(&mut stream, 0, "invalid pull").await?;
+                            error!("Failed to parse Lumina PullMetadata: {}", e);
+                            lumina::send_lumina_fail(&mut stream, 0, "invalid pull").await?;
                             continue;
                         }
                     };
 
-                    debug!("Legacy PULL request: {} keys", pull_msg.funcs.len());
+                    debug!("Lumina PULL request: {} keys", pull_msg.funcs.len());
                     METRICS.queried_funcs.fetch_add(pull_msg.funcs.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     
                     let mut statuses = Vec::with_capacity(pull_msg.funcs.len());
@@ -311,28 +311,28 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     }
                     
                     METRICS.pulls.fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    debug!("Legacy PULL response: {} found, {} not found", found.len(), statuses.iter().filter(|&&s| s == 1).count());
-                    legacy::send_legacy_pull_result(&mut stream, &statuses, &found).await?;
+                    debug!("Lumina PULL response: {} found, {} not found", found.len(), statuses.iter().filter(|&&s| s == 1).count());
+                    lumina::send_lumina_pull_result(&mut stream, &statuses, &found).await?;
                 },
                 0x10 => { // PushMetadata
-                    let caps = legacy::LegacyCaps {
+                    let caps = lumina::LuminaCaps {
                         max_funcs: cfg.limits.max_push_items,
                         max_name_bytes: cfg.limits.max_name_bytes,
                         max_data_bytes: cfg.limits.max_data_bytes,
-                        max_cstr_bytes: cfg.limits.legacy_max_cstr_bytes,
-                        max_hash_bytes: cfg.limits.legacy_max_hash_bytes,
+                        max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                        max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
                     };
 
-                    let push_msg = match legacy::parse_legacy_push_metadata(pld, caps) {
+                    let push_msg = match lumina::parse_lumina_push_metadata(pld, caps) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!("Failed to parse legacy PushMetadata: {}", e);
-                            legacy::send_legacy_fail(&mut stream, 0, "invalid push").await?;
+                            error!("Failed to parse Lumina PushMetadata: {}", e);
+                            lumina::send_lumina_fail(&mut stream, 0, "invalid push").await?;
                             continue;
                         }
                     };
 
-                    debug!("Legacy PUSH request: {} items", push_msg.funcs.len());
+                    debug!("Lumina PUSH request: {} items", push_msg.funcs.len());
                     
                     let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> = Vec::with_capacity(push_msg.funcs.len());
                     for func in &push_msg.funcs {
@@ -360,52 +360,52 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             METRICS.new_funcs.fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
                             
                             debug!(
-                                "Legacy PUSH response: {} new, {} updated, {} unchanged", 
+                                "Lumina PUSH response: {} new, {} updated, {} unchanged", 
                                 new_funcs, updated_funcs, skipped_funcs
                             );
                             
-                            // Legacy client: 1 = new/success, 0 = not new/skipped
+                            // Lumina client: 1 = new/success, 0 = not new/skipped
                             // Map: 1 (new) → 1, 0 (updated) → 1, 2 (unchanged/skipped) → 0
-                            let legacy_status: Vec<u32> = status.iter().map(|&s| if s == 2 { 0 } else { 1 }).collect();
-                            legacy::send_legacy_push_result(&mut stream, &legacy_status).await?;
+                            let lumina_status: Vec<u32> = status.iter().map(|&s| if s == 2 { 0 } else { 1 }).collect();
+                            lumina::send_lumina_push_result(&mut stream, &lumina_status).await?;
                         },
                         Err(e) => {
                             error!("db push: {}", e);
-                            legacy::send_legacy_fail(&mut stream, 0, &format!("{}: db error; please try again later", cfg.lumina.server_name)).await?;
+                            lumina::send_lumina_fail(&mut stream, 0, &format!("{}: db error; please try again later", cfg.lumina.server_name)).await?;
                         }
                     }
                 },
                 0x18 => { // DelHistory
                     if !cfg.lumina.allow_deletes {
-                        legacy::send_legacy_fail(&mut stream, 2, &format!("{}: Delete command is disabled on this server.", cfg.lumina.server_name)).await?;
+                        lumina::send_lumina_fail(&mut stream, 2, &format!("{}: Delete command is disabled on this server.", cfg.lumina.server_name)).await?;
                         continue;
                     }
-                    debug!("Legacy DEL request (not fully implemented)");
-                    legacy::send_legacy_del_result(&mut stream, 0).await?;
+                    debug!("Lumina DEL request (not fully implemented)");
+                    lumina::send_lumina_del_result(&mut stream, 0).await?;
                 },
                 0x2f => { // GetFuncHistories
-                    let caps = legacy::LegacyCaps {
+                    let caps = lumina::LuminaCaps {
                         max_funcs: cfg.limits.max_hist_items,
                         max_name_bytes: cfg.limits.max_name_bytes,
                         max_data_bytes: cfg.limits.max_data_bytes,
-                        max_cstr_bytes: cfg.limits.legacy_max_cstr_bytes,
-                        max_hash_bytes: cfg.limits.legacy_max_hash_bytes,
+                        max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                        max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
                     };
 
-                    let hist_msg = match legacy::parse_legacy_get_func_histories(pld, caps) {
+                    let hist_msg = match lumina::parse_lumina_get_func_histories(pld, caps) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!("Failed to parse legacy GetFuncHistories: {}", e);
-                            legacy::send_legacy_fail(&mut stream, 0, "invalid hist").await?;
+                            error!("Failed to parse Lumina GetFuncHistories: {}", e);
+                            lumina::send_lumina_fail(&mut stream, 0, "invalid hist").await?;
                             continue;
                         }
                     };
 
-                    debug!("Legacy HIST request: {} keys", hist_msg.funcs.len());
+                    debug!("Lumina HIST request: {} keys", hist_msg.funcs.len());
                     
                     let limit = if cfg.lumina.get_history_limit == 0 { 0 } else { cfg.lumina.get_history_limit };
                     if limit == 0 {
-                        legacy::send_legacy_fail(&mut stream, 4, &format!("{}: function histories are disabled on this server.", cfg.lumina.server_name)).await?;
+                        lumina::send_lumina_fail(&mut stream, 4, &format!("{}: function histories are disabled on this server.", cfg.lumina.server_name)).await?;
                         continue;
                     }
                     
@@ -435,18 +435,18 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             Ok(_) => { statuses.push(0); },
                             Err(e) => {
                                 error!("db hist: {}", e);
-                                legacy::send_legacy_fail(&mut stream, 3, &format!("{}: db error", cfg.lumina.server_name)).await?;
+                                lumina::send_lumina_fail(&mut stream, 3, &format!("{}: db error", cfg.lumina.server_name)).await?;
                                 return Ok(());
                             }
                         }
                     }
                     
-                    debug!("Legacy HIST response: {} histories found", histories.len());
-                    legacy::send_legacy_histories_result(&mut stream, &statuses, &histories).await?;
+                    debug!("Lumina HIST response: {} histories found", histories.len());
+                    lumina::send_lumina_histories_result(&mut stream, &statuses, &histories).await?;
                 },
                 _ => {
-                    warn!("Unknown legacy command: 0x{:02x}", typ);
-                    legacy::send_legacy_fail(&mut stream, 0, &format!("{}: Unknown command.", cfg.lumina.server_name)).await?;
+                    warn!("Unknown Lumina command: 0x{:02x}", typ);
+                    lumina::send_lumina_fail(&mut stream, 0, &format!("{}: Unknown command.", cfg.lumina.server_name)).await?;
                     continue;
                 }
             }

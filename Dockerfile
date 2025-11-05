@@ -28,7 +28,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
-COPY --from=builder /app/target/release/lumen /app/lumen
+COPY --from=builder /app/target/release/dazhbog /app/dazhbog
 
 # Copy config and data if needed
 COPY config.toml ./
@@ -38,4 +38,4 @@ COPY data ./data
 EXPOSE 1234
 
 # Run the binary
-CMD ["./lumen"]
+CMD ["./dazhbog"]

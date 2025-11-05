@@ -1,5 +1,5 @@
-// Legacy protocol support for backward compatibility with lumen-master
-// This implements the custom serialization format used by IDA Pro's Lumina plugin
+// Lumina protocol support for IDA Pro's Lumina plugin
+// This implements the custom serialization format used by IDA Pro
 
 use log::*;
 use bytes::BytesMut;
@@ -7,23 +7,23 @@ use tokio::io::AsyncWriteExt;
 use std::io;
 
 #[derive(Debug)]
-pub enum LegacyError {
+pub enum LuminaError {
     UnexpectedEof,
     InvalidData,
 }
 
-impl std::fmt::Display for LegacyError {
+impl std::fmt::Display for LuminaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LegacyError::UnexpectedEof => write!(f, "unexpected EOF"),
-            LegacyError::InvalidData => write!(f, "invalid data"),
+            LuminaError::UnexpectedEof => write!(f, "unexpected EOF"),
+            LuminaError::InvalidData => write!(f, "invalid data"),
         }
     }
 }
 
-impl std::error::Error for LegacyError {}
+impl std::error::Error for LuminaError {}
 
-pub struct LegacyHello {
+pub struct LuminaHello {
     pub protocol_version: u32,
     pub username: String,
     pub password: String,
@@ -32,7 +32,7 @@ pub struct LegacyHello {
 // --- Caps for safe parsing ---
 
 #[derive(Clone, Copy, Debug)]
-pub struct LegacyCaps {
+pub struct LuminaCaps {
     pub max_funcs: usize,
     pub max_name_bytes: usize,
     pub max_data_bytes: usize,
@@ -93,10 +93,10 @@ fn unpack_dd(data: &[u8]) -> (u32, usize) {
 
 // --- Capped C-string unpacker ---
 
-fn unpack_cstr_capped(data: &[u8], max: usize) -> Result<(String, usize), LegacyError> {
-    let null_pos = data.iter().position(|&b| b == 0).ok_or(LegacyError::UnexpectedEof)?;
-    if null_pos > max { return Err(LegacyError::InvalidData); }
-    let s = std::str::from_utf8(&data[..null_pos]).map_err(|_| LegacyError::InvalidData)?;
+fn unpack_cstr_capped(data: &[u8], max: usize) -> Result<(String, usize), LuminaError> {
+    let null_pos = data.iter().position(|&b| b == 0).ok_or(LuminaError::UnexpectedEof)?;
+    if null_pos > max { return Err(LuminaError::InvalidData); }
+    let s = std::str::from_utf8(&data[..null_pos]).map_err(|_| LuminaError::InvalidData)?;
     Ok((s.to_string(), null_pos + 1))
 }
 
@@ -128,40 +128,40 @@ fn pack_dq(v: u64) -> Vec<u8> {
 
 /// Parse variable-length byte array (length-prefixed with dd encoding)
 /// Returns (bytes, bytes_consumed)
-fn unpack_var_bytes_capped(data: &[u8], max_len: usize) -> Result<(&[u8], usize), LegacyError> {
+fn unpack_var_bytes_capped(data: &[u8], max_len: usize) -> Result<(&[u8], usize), LuminaError> {
     let (len, consumed) = unpack_dd(data);
     if consumed == 0 {
-        return Err(LegacyError::UnexpectedEof);
+        return Err(LuminaError::UnexpectedEof);
     }
     let len = len as usize;
-    if len > max_len { return Err(LegacyError::InvalidData); }
+    if len > max_len { return Err(LuminaError::InvalidData); }
     let data = &data[consumed..];
     if data.len() < len {
-        return Err(LegacyError::UnexpectedEof);
+        return Err(LuminaError::UnexpectedEof);
     }
     Ok((&data[..len], consumed + len))
 }
 
-/// Parse legacy Hello message (0x0d message type)
-pub fn parse_legacy_hello(payload: &[u8]) -> Result<LegacyHello, LegacyError> {
+/// Parse Lumina Hello message (0x0d message type)
+pub fn parse_lumina_hello(payload: &[u8]) -> Result<LuminaHello, LuminaError> {
     let mut offset = 0;
     let (protocol_version, consumed) = unpack_dd(&payload[offset..]);
-    if consumed == 0 { return Err(LegacyError::UnexpectedEof); }
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
-    debug!("Legacy Hello: protocol_version={}", protocol_version);
+    debug!("Lumina Hello: protocol_version={}", protocol_version);
     
     // license_data (unused / discarded safely with small cap)
     let (_license_data, consumed) = unpack_var_bytes_capped(&payload[offset..], 4096)?;
     offset += consumed;
-    debug!("Legacy Hello: license_data processed");
+    debug!("Lumina Hello: license_data processed");
     
     // lic_number (6 bytes)
-    if payload.len() < offset + 6 { return Err(LegacyError::UnexpectedEof); }
+    if payload.len() < offset + 6 { return Err(LuminaError::UnexpectedEof); }
     offset += 6;
     
     // unk2
     let (_unk2, consumed) = unpack_dd(&payload[offset..]);
-    if consumed == 0 { return Err(LegacyError::UnexpectedEof); }
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
 
     // Credentials (optional)
@@ -180,27 +180,27 @@ pub fn parse_legacy_hello(payload: &[u8]) -> Result<LegacyHello, LegacyError> {
         ("guest".to_string(), String::new())
     };
     
-    Ok(LegacyHello { protocol_version, username, password })
+    Ok(LuminaHello { protocol_version, username, password })
 }
 
-// Legacy message structures
+// Lumina message structures
 // Note: Many fields are parsed for protocol compatibility but not used by server logic
 
-pub struct LegacyPullMetadataFunc {
+pub struct LuminaPullMetadataFunc {
     #[allow(dead_code)]
     pub unk0: u32,
     pub mb_hash: Vec<u8>,
 }
 
-pub struct LegacyPullMetadata {
+pub struct LuminaPullMetadata {
     #[allow(dead_code)]
     pub unk0: u32,
     #[allow(dead_code)]
     pub unk1: Vec<u32>,
-    pub funcs: Vec<LegacyPullMetadataFunc>,
+    pub funcs: Vec<LuminaPullMetadataFunc>,
 }
 
-pub struct LegacyPushMetadataFunc {
+pub struct LuminaPushMetadataFunc {
     pub name: String,
     pub func_len: u32,
     pub func_data: Vec<u8>,
@@ -209,7 +209,7 @@ pub struct LegacyPushMetadataFunc {
     pub hash: Vec<u8>,
 }
 
-pub struct LegacyPushMetadata {
+pub struct LuminaPushMetadata {
     #[allow(dead_code)]
     pub unk0: u32,
     #[allow(dead_code)]
@@ -220,42 +220,42 @@ pub struct LegacyPushMetadata {
     pub md5: [u8; 16],
     #[allow(dead_code)]
     pub hostname: String,
-    pub funcs: Vec<LegacyPushMetadataFunc>,
+    pub funcs: Vec<LuminaPushMetadataFunc>,
     #[allow(dead_code)]
     pub unk1: Vec<u64>,
 }
 
-pub struct LegacyGetFuncHistories {
-    pub funcs: Vec<LegacyPullMetadataFunc>,
+pub struct LuminaGetFuncHistories {
+    pub funcs: Vec<LuminaPullMetadataFunc>,
     #[allow(dead_code)]
     pub unk0: u32,
 }
 
-/// Parse legacy PullMetadata (0x0e) with caps
-pub fn parse_legacy_pull_metadata(payload: &[u8], caps: LegacyCaps) -> Result<LegacyPullMetadata, LegacyError> {
+/// Parse Lumina PullMetadata (0x0e) with caps
+pub fn parse_lumina_pull_metadata(payload: &[u8], caps: LuminaCaps) -> Result<LuminaPullMetadata, LuminaError> {
     let mut offset = 0;
-    debug!("parse_legacy_pull_metadata: payload len={}", payload.len());
+    debug!("parse_lumina_pull_metadata: payload len={}", payload.len());
     
     let (unk0, consumed) = unpack_dd(&payload[offset..]);
-    if consumed == 0 { return Err(LegacyError::UnexpectedEof); }
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
 
     // unk1: Vec<u32>
     let (count1, consumed) = unpack_dd(&payload[offset..]);
-    if consumed == 0 { return Err(LegacyError::UnexpectedEof); }
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
     
     let mut unk1 = Vec::with_capacity((count1 as usize).min(1024));
     for _ in 0..count1 {
         let (v, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
         unk1.push(v);
     }
     
     // funcs: Vec<PullMetadataFunc>
     let (count_funcs, consumed) = unpack_dd(&payload[offset..]);
-    if consumed == 0 { return Err(LegacyError::UnexpectedEof); }
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
 
     let n = (count_funcs as usize).min(caps.max_funcs);
@@ -264,7 +264,7 @@ pub fn parse_legacy_pull_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
     for i in 0..count_funcs {
         // unk0
         let (func_unk0, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
         // mb_hash
@@ -272,20 +272,20 @@ pub fn parse_legacy_pull_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
         offset += c;
 
         if (i as usize) < n {
-            funcs.push(LegacyPullMetadataFunc { unk0: func_unk0, mb_hash: hash.to_vec() });
+            funcs.push(LuminaPullMetadataFunc { unk0: func_unk0, mb_hash: hash.to_vec() });
         }
     }
 
-    Ok(LegacyPullMetadata { unk0, unk1, funcs })
+    Ok(LuminaPullMetadata { unk0, unk1, funcs })
 }
 
-/// Parse legacy PushMetadata (0x10) with caps
-pub fn parse_legacy_push_metadata(payload: &[u8], caps: LegacyCaps) -> Result<LegacyPushMetadata, LegacyError> {
+/// Parse Lumina PushMetadata (0x10) with caps
+pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<LuminaPushMetadata, LuminaError> {
     let mut offset = 0;
-    debug!("parse_legacy_push_metadata: payload len={}", payload.len());
+    debug!("parse_lumina_push_metadata: payload len={}", payload.len());
     
     let (unk0, consumed) = unpack_dd(&payload[offset..]);
-    if consumed == 0 { return Err(LegacyError::UnexpectedEof); }
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
     
     // idb_path, file_path, hostname with C-string caps
@@ -295,7 +295,7 @@ pub fn parse_legacy_push_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
     let (file_path, c) = unpack_cstr_capped(&payload[offset..], caps.max_cstr_bytes)?;
     offset += c;
 
-    if payload.len() < offset + 16 { return Err(LegacyError::UnexpectedEof); }
+    if payload.len() < offset + 16 { return Err(LuminaError::UnexpectedEof); }
     let mut md5 = [0u8; 16];
     md5.copy_from_slice(&payload[offset..offset+16]);
     offset += 16;
@@ -305,13 +305,13 @@ pub fn parse_legacy_push_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
 
     // funcs
     let (count_funcs, c) = unpack_dd(&payload[offset..]);
-    if c == 0 { return Err(LegacyError::UnexpectedEof); }
+    if c == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += c;
     
     // Reject requests that exceed the cap instead of silently truncating
     if count_funcs as usize > caps.max_funcs {
         log::warn!("Push request contains {} functions but limit is {}", count_funcs, caps.max_funcs);
-        return Err(LegacyError::InvalidData);
+        return Err(LuminaError::InvalidData);
     }
 
     let n = count_funcs as usize;
@@ -322,27 +322,27 @@ pub fn parse_legacy_push_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
         offset += c;
 
         let (func_len, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
         let (func_data, c) = unpack_var_bytes_capped(&payload[offset..], caps.max_data_bytes)?;
         offset += c;
 
         let (unk2, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
         let (hash, c) = unpack_var_bytes_capped(&payload[offset..], caps.max_hash_bytes)?;
         offset += c;
 
-        funcs.push(LegacyPushMetadataFunc {
+        funcs.push(LuminaPushMetadataFunc {
             name, func_len, func_data: func_data.to_vec(), unk2, hash: hash.to_vec(),
         });
     }
 
     // unk1: Vec<u64> (capped by reasonable upper bound)
     let (count_u64, c) = unpack_dd(&payload[offset..]);
-    if c == 0 { return Err(LegacyError::UnexpectedEof); }
+    if c == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += c;
 
     let cap_u64s = 4096usize.min(count_u64 as usize);
@@ -350,11 +350,11 @@ pub fn parse_legacy_push_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
 
     for i in 0..count_u64 {
         let (high, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
         let (low, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
         if (i as usize) < cap_u64s {
@@ -362,17 +362,17 @@ pub fn parse_legacy_push_metadata(payload: &[u8], caps: LegacyCaps) -> Result<Le
         }
     }
 
-    Ok(LegacyPushMetadata {
+    Ok(LuminaPushMetadata {
         unk0, idb_path, file_path, md5, hostname, funcs, unk1,
     })
 }
 
-/// Parse legacy GetFuncHistories (0x2f) with caps
-pub fn parse_legacy_get_func_histories(payload: &[u8], caps: LegacyCaps) -> Result<LegacyGetFuncHistories, LegacyError> {
+/// Parse Lumina GetFuncHistories (0x2f) with caps
+pub fn parse_lumina_get_func_histories(payload: &[u8], caps: LuminaCaps) -> Result<LuminaGetFuncHistories, LuminaError> {
     let mut offset = 0;
 
     let (count, c) = unpack_dd(&payload[offset..]);
-    if c == 0 { return Err(LegacyError::UnexpectedEof); }
+    if c == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += c;
 
     let n = (count as usize).min(caps.max_funcs);
@@ -380,34 +380,34 @@ pub fn parse_legacy_get_func_histories(payload: &[u8], caps: LegacyCaps) -> Resu
 
     for i in 0..count {
         let (func_unk0, c) = unpack_dd(&payload[offset..]);
-        if c == 0 { return Err(LegacyError::UnexpectedEof); }
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
         let (hash, c) = unpack_var_bytes_capped(&payload[offset..], caps.max_hash_bytes)?;
         offset += c;
 
         if (i as usize) < n {
-            funcs.push(LegacyPullMetadataFunc { unk0: func_unk0, mb_hash: hash.to_vec() });
+            funcs.push(LuminaPullMetadataFunc { unk0: func_unk0, mb_hash: hash.to_vec() });
         }
     }
 
     let (unk0, _c) = unpack_dd(&payload[offset..]);
 
-    Ok(LegacyGetFuncHistories { funcs, unk0 })
+    Ok(LuminaGetFuncHistories { funcs, unk0 })
 }
 
-/// Write a packet in legacy format:
+/// Write a packet in Lumina format:
 /// - 4 bytes: big-endian length (payload length, not including message type)
 /// - 1 byte: message type
 /// - N bytes: payload
-pub async fn write_legacy_packet<W: AsyncWriteExt + Unpin>(
+pub async fn write_lumina_packet<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     msg_type: u8,
     payload: &[u8],
 ) -> io::Result<()> {
     let len = payload.len() as u32;
     let len_bytes = len.to_be_bytes();
-    debug!("write_legacy_packet: type=0x{:02x}, payload_len={}", msg_type, len);
+    debug!("write_lumina_packet: type=0x{:02x}, payload_len={}", msg_type, len);
     w.write_all(&len_bytes).await?;
     w.write_u8(msg_type).await?;
     w.write_all(payload).await?;
@@ -415,13 +415,13 @@ pub async fn write_legacy_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Send legacy OK response (0x0a with empty payload)
-pub async fn send_legacy_ok<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
-    write_legacy_packet(w, 0x0a, &[]).await
+/// Send Lumina OK response (0x0a with empty payload)
+pub async fn send_lumina_ok<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
+    write_lumina_packet(w, 0x0a, &[]).await
 }
 
-/// Send legacy HelloResult response (0x31) for protocol version >= 5
-pub async fn send_legacy_hello_result<W: AsyncWriteExt + Unpin>(
+/// Send Lumina HelloResult response (0x31) for protocol version >= 5
+pub async fn send_lumina_hello_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     features: u32,
 ) -> io::Result<()> {
@@ -439,11 +439,11 @@ pub async fn send_legacy_hello_result<W: AsyncWriteExt + Unpin>(
         let b2 = (features & 0xFF) as u8;
         payload.extend_from_slice(&[b1, b2]);
     }
-    write_legacy_packet(w, 0x31, &payload).await
+    write_lumina_packet(w, 0x31, &payload).await
 }
 
-/// Send legacy Fail response (0x0b) - dd-encoded code (LE as per unpacker) + cstr
-pub async fn send_legacy_fail<W: AsyncWriteExt + Unpin>(
+/// Send Lumina Fail response (0x0b) - dd-encoded code (LE as per unpacker) + cstr
+pub async fn send_lumina_fail<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     code: u32,
     message: &str,
@@ -452,12 +452,12 @@ pub async fn send_legacy_fail<W: AsyncWriteExt + Unpin>(
     payload.extend_from_slice(&pack_dd(code));
     payload.extend_from_slice(message.as_bytes());
     payload.extend_from_slice(b"\0");
-    write_legacy_packet(w, 0x0b, &payload).await
+    write_lumina_packet(w, 0x0b, &payload).await
 }
 
-// Legacy result encoders (unchanged except bounds-safe construction)
+// Lumina result encoders (unchanged except bounds-safe construction)
 
-pub async fn send_legacy_pull_result<W: AsyncWriteExt + Unpin>(
+pub async fn send_lumina_pull_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     statuses: &[u32],
     funcs: &[(u32, u32, String, Vec<u8>)],  // (popularity, len, name, data)
@@ -476,10 +476,10 @@ pub async fn send_legacy_pull_result<W: AsyncWriteExt + Unpin>(
         payload.extend_from_slice(data);
         payload.extend_from_slice(&pack_dd(*pop));
     }
-    write_legacy_packet(w, 0x0f, &payload).await
+    write_lumina_packet(w, 0x0f, &payload).await
 }
 
-pub async fn send_legacy_push_result<W: AsyncWriteExt + Unpin>(
+pub async fn send_lumina_push_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     status: &[u32],
 ) -> io::Result<()> {
@@ -488,18 +488,18 @@ pub async fn send_legacy_push_result<W: AsyncWriteExt + Unpin>(
     for &s in status {
         payload.extend_from_slice(&pack_dd(s));
     }
-    write_legacy_packet(w, 0x11, &payload).await
+    write_lumina_packet(w, 0x11, &payload).await
 }
 
-pub async fn send_legacy_del_result<W: AsyncWriteExt + Unpin>(
+pub async fn send_lumina_del_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     deleted_mds: u32,
 ) -> io::Result<()> {
     let payload = pack_dd(deleted_mds);
-    write_legacy_packet(w, 0x19, &payload).await
+    write_lumina_packet(w, 0x19, &payload).await
 }
 
-pub async fn send_legacy_histories_result<W: AsyncWriteExt + Unpin>(
+pub async fn send_lumina_histories_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     statuses: &[u32],
     histories: &[Vec<(u64, String, Vec<u8>)>],
@@ -526,7 +526,7 @@ pub async fn send_legacy_histories_result<W: AsyncWriteExt + Unpin>(
     }
     payload.extend_from_slice(&pack_dd(0)); // users
     payload.extend_from_slice(&pack_dd(0)); // dbs
-    write_legacy_packet(w, 0x30, &payload).await
+    write_lumina_packet(w, 0x30, &payload).await
 }
 
 #[cfg(test)]

@@ -4,20 +4,31 @@
 
 <br />
 
-`dazhbog` is a reimplementation of a Lumina protocol server designed for storing and retrieving function signatures used by IDA Pro's reverse engineering features. Unlike `lumen`, which relies on PostgreSQL, `dazhbog` uses a custom append-only storage engine with no external database dependencies, making it ideal for embedded deployment, edge computing, or standalone research environments.
+`dazhbog` is a reimplementation of a Lumina protocol server designed for storing and retrieving function signatures used by IDA Pro's reverse engineering features.
+
+---------------
+
+<h3 align=center>Public dazhbog server</h3>
+
+<div align=center>It supports both TLS and plaintext on the same port.<br/>It does NOT require any special configuration.</div>
+
+<h3 align=center><i>host</i>: ida.int.mov<br/><i>port</i>: 1234</h3>
+<h3 align=center><i>user</i>: guest<br/><i>pass</i>: guest</h3>
+
+---------------
 
 ### Installation
 
 ```shell
 cargo build --release
-./target/release/lumen config.toml
+./target/release/dazhbog config.toml
 ```
 
 ### Example Usage
 
 ```bash
 # Start the server
-./lumen config.toml
+./dazhbog config.toml
 
 # Configure IDA Pro >= 8.1
 export LUMINA_TLS=false
@@ -89,7 +100,7 @@ Deletions are implemented via tombstone records (`flags & 0x01`). The index poin
 `dazhbog` implements full compatibility with the IDA Pro Lumina protocol:
 
 **Protocol Details:**
-*   Hello message type: `0x0d`
+*   Lumina hello message type: `0x0d`
 *   Variable-length integer encoding (IDA's proprietary `dd` format)
 *   Commands: `PullMetadata (0x0e)`, `PushMetadata (0x10)`, `DelHistory (0x18)`, `GetFuncHistories (0x2f)`
 *   License data validation (bypassed in guest mode)
@@ -101,48 +112,26 @@ All messages use a 4-byte big-endian length prefix followed by the message type 
 [LENGTH:4 BE] [TYPE:1] [PAYLOAD:variable]
 ```
 
-#### Differences from Lumen
+### Architecture & Design
 
-| Feature | Lumen | Dazhbog |
-|---------|-------|---------|
-| **Storage Backend** | PostgreSQL | Custom append-only log |
-| **External Dependencies** | Requires PostgreSQL server, Diesel ORM | Zero external dependencies |
-| **Index Structure** | PostgreSQL B-tree indexes | In-memory sharded hash table |
-| **Function History** | SQL queries with JOINs | Linked list traversal via `prev_addr` |
-| **Write Performance** | INSERT with index updates | Sequential append-only writes |
-| **Read Performance** | SQL SELECT with indexes | Direct memory lookup + disk seek |
-| **Data Integrity** | PostgreSQL MVCC + WAL | Per-record CRC32C checksums |
-| **Scalability** | Vertical (PostgreSQL limits) | Horizontal (segment sharding) |
-| **Deployment** | Requires DB setup, migrations | Single binary, no migrations |
-| **Persistence** | ACID compliant | Crash recovery via index rebuild |
-**Protocol Support** | IDA Pro Lumina protocol | IDA Pro Lumina protocol |
-| **Memory Usage** | ~50 MB base + query cache | ~10 MB base + index size |
-| **Startup Time** | Instant (DB connection) | O(n) segment scan for index rebuild |
-
-**Key Technical Distinctions:**
+**Key Technical Features:**
 
 1.  **Storage Model:**
-    *   Lumen uses PostgreSQL's row-oriented storage with MVCC for concurrency control. Function updates require updating multiple indexes.
     *   Dazhbog uses append-only storage where updates are new records linked to old versions. No in-place updates.
 
 2.  **Index Strategy:**
-    *   Lumen relies on PostgreSQL's B-tree indexes (disk-backed) for function key lookups.
     *   Dazhbog maintains a purely in-memory hash index rebuilt on startup. This trades memory for speed.
 
 3.  **Concurrency:**
-    *   Lumen leverages PostgreSQL's connection pooling and row-level locking.
     *   Dazhbog uses lock-free concurrent data structures (`DashMap`) with optimistic concurrency for the index and coarse-grained locks for segment writes.
 
 4.  **History Implementation:**
-    *   Lumen stores history as separate rows in a `function_history` table with foreign keys.
     *   Dazhbog embeds history in each record via `prev_addr`, forming a reverse-chronological linked list.
 
-5.  **Operational Complexity:**
-    *   Lumen requires PostgreSQL administration, backups, migrations, and connection pooling tuning.
+5.  **Operational Simplicity:**
     *   Dazhbog is a single binary with file-based storage that can be copied/backed up like any directory.
 
 6.  **Use Case Optimization:**
-    *   Lumen is optimized for centralized team servers with heavy read patterns and complex queries.
     *   Dazhbog is optimized for embedded deployment, personal use, air-gapped networks, and write-heavy workloads.
 
 ### Configuration
@@ -253,22 +242,22 @@ for segment in segments_on_disk {
 The HTTP server exposes metrics at `http://localhost:8080/metrics`:
 
 ```
-# HELP lumina_active_connections Active client connections
-# TYPE lumina_active_connections gauge
-lumina_active_connections 42
+# HELP dazhbog_active_connections Active client connections
+# TYPE dazhbog_active_connections gauge
+dazhbog_active_connections 42
 
-# HELP lumina_pushes_total Function metadata push operations
-# TYPE lumina_pushes_total counter
-lumina_pushes_total 1523
+# HELP dazhbog_pushes_total Function metadata push operations
+# TYPE dazhbog_pushes_total counter
+dazhbog_pushes_total 1523
 
-# HELP lumina_pulls_total Function metadata pull operations
-# TYPE lumina_pulls_total counter
-lumina_pulls_total 8921
+# HELP dazhbog_pulls_total Function metadata pull operations
+# TYPE dazhbog_pulls_total counter
+dazhbog_pulls_total 8921
 ```
 
 ### Notes
 
-*   The server name "dazhbog" (Дажьбог) is a Slavic sun deity, chosen as a counterpart to "lumen" (Latin for light).
+*   The server name "dazhbog" (Дажьбог) is a Slavic sun deity.
 *   The storage engine is inspired by Bitcask and LSM trees but optimized for function signature workloads.
 *   Full compatibility with IDA Pro's Lumina protocol across all versions (7.2+).
 *   No authentication beyond username checking is implemented (designed for private networks).
