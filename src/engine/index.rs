@@ -76,9 +76,7 @@ pub enum UpsertResult {
 }
 
 pub enum IndexError {
-    /// Capacity/overflow style error (historical compatibility with in-mem index).
     Full,
-    /// Underlying IO error.
     Io(io::Error),
 }
 
@@ -92,11 +90,8 @@ impl From<io::Error> for IndexError {
 
 #[derive(Clone, Debug)]
 pub struct IndexOptions {
-    /// Maximum entries in the memtable before a flush.
     pub memtable_max_entries: usize,
-    /// Number of entries per on-disk block in SSTables.
     pub sst_block_entries: usize,
-    /// Trigger a full compaction when level-0 file count exceeds this.
     pub level0_compact_trigger: usize,
 }
 
@@ -112,7 +107,7 @@ impl IndexOptions {
 
 // =============================== Internals ==================================
 
-const SST_MAGIC_TRAILER: u32 = 0x4C495A44; // 'L','I','Z','D'
+const SST_MAGIC_TRAILER: u32 = 0x4C495A44;
 const WAL_FILE_NAME: &str = "wal.dat";
 
 #[derive(Clone, Copy)]
@@ -123,12 +118,11 @@ enum WalTag {
 
 #[inline]
 fn key_cmp(a: &u128, b: &u128) -> Ordering {
-    a.cmp(b) // native u128 order (big-endian numeric order)
+    a.cmp(b)
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Entry {
-    // None → logical deletion tombstone in the LSM layer.
     val: Option<u64>,
 }
 
@@ -170,7 +164,6 @@ impl Wal {
         Ok(())
     }
 
-    /// Replay all valid records (CRC-verified). Trailing junk/partial record is ignored.
     fn replay(&mut self) -> io::Result<Vec<(WalTag, u128, Option<u64>)>> {
         let mut out = Vec::new();
         self.file.seek(SeekFrom::Start(0))?;
@@ -190,7 +183,6 @@ impl Wal {
                     let crc = u32::from_le_bytes(c_bytes);
                     let calc = crc32c(0, &buf[..1 + 16 + 8]);
                     if calc != crc {
-                        // Stop at the first corruption/partial (treat rest as garbage).
                         break;
                     }
                     match tag {
@@ -207,10 +199,8 @@ impl Wal {
         Ok(out)
     }
 
-    /// Replace WAL atomically with an empty one (after flush).
     fn reset(&mut self) -> io::Result<()> {
         let _ = &self.file;
-        // Atomic reset: remove the old file then create a fresh one.
         let _ = fs::remove_file(&self.path);
         self.file = OpenOptions::new()
             .create(true)
@@ -254,7 +244,6 @@ impl SstReader {
         if magic != SST_MAGIC_TRAILER {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad sst trailer"));
         }
-        // Read index
         let mut idx_head = [0u8; 4 + 8];
         file.read_exact_at(&mut idx_head, index_off)?;
         let mut n_bytes = [0u8; 4];
@@ -290,13 +279,10 @@ impl SstReader {
         })
     }
 
-    /// Find key in this table; `Some(Some(addr))` for value, `Some(None)` for a delete tombstone,
-    /// `None` for not found in this SSTable.
     fn get(&self, key: u128) -> io::Result<Option<Option<u64>>> {
         if self.blocks.is_empty() {
             return Ok(None);
         }
-        // Binary search lower_bound of first_key > key
         let mut lo = 0usize;
         let mut hi = self.blocks.len();
         while lo < hi {
@@ -314,7 +300,6 @@ impl SstReader {
         }
         let idx = lo - 1;
         let bm = &self.blocks[idx];
-        // Read the block and scan for the exact key (blocks are small).
         let mut head = [0u8; 4];
         self.file.read_exact_at(&mut head, bm.offset)?;
         let mut n_bytes = [0u8; 4];
@@ -347,7 +332,7 @@ impl SstReader {
                 Ordering::Equal => {
                     return Ok(Some(if tag == 0 { None } else { Some(addr) }));
                 }
-                Ordering::Greater => break, // short-circuit: keys in block are sorted
+                Ordering::Greater => break,
                 Ordering::Less => continue,
             }
         }
@@ -407,7 +392,7 @@ impl<'a> SstIter<'a> {
                 "block crc mismatch (iter)",
             ));
         }
-        self.cursor = 4; // start of payload
+        self.cursor = 4;
         self.entries_left_in_block = count;
         self.block_idx += 1;
         Ok(true)
@@ -420,7 +405,6 @@ impl<'a> Iterator for SstIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.entries_left_in_block > 0 {
-                // read one record
                 let k = {
                     let mut kb = [0u8; 16];
                     kb.copy_from_slice(&self.block_buf[self.cursor..self.cursor + 16]);
@@ -480,7 +464,7 @@ impl SstWriter {
 
     fn push(&mut self, key: u128, val: Entry) -> io::Result<()> {
         if self.cur_block.is_empty() || self.cur_block.last().unwrap().0 <= key {
-            // ok (keys must be sorted ascending)
+            // ok
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -500,7 +484,6 @@ impl SstWriter {
         }
         let first_key = self.cur_block[0].0;
         let offset = self.file.seek(SeekFrom::End(0))?;
-        // Build block payload
         let count = self.cur_block.len();
         let payload_len = (16 + 1 + 8) * count;
         let mut buf = Vec::with_capacity(4 + payload_len + 4);
@@ -525,7 +508,6 @@ impl SstWriter {
 
     fn finish(mut self) -> io::Result<SstReader> {
         self.flush_block()?;
-        // Write index: [u32 block_count][u64 total_entries][repeated (key,off,len)] [u64 idx_off][u32 magic]
         let idx_off = self.file.seek(SeekFrom::End(0))?;
         self.file
             .write_all(&(self.index.len() as u32).to_le_bytes())?;
@@ -540,24 +522,17 @@ impl SstWriter {
         self.file
             .write_all(&SST_MAGIC_TRAILER.to_le_bytes())?;
         self.file.flush()?;
-        // Open a reader on the newly created table
-        SstReader::open(self.path, 0) // seq is parsed from filename by caller
+        SstReader::open(self.path, 0)
     }
 }
-
-// ============================ Disk-backed index =============================
 
 pub struct ShardlessDiskIndex {
     dir: PathBuf,
     opts: IndexOptions,
-    // Serialize apply (WAL+memtable mutation).
     apply_lock: Mutex<()>,
     wal: Mutex<Wal>,
-    // Hot in-memory structures
     mem: RwLock<BTreeMap<u128, Entry>>,
-    // SSTables (newest first). Each reader stores its parsed fence pointers.
     ssts: RwLock<Vec<Arc<SstReader>>>,
-    // Next monotonically increasing sequence used in file names.
     seq: AtomicU64,
 }
 
@@ -568,7 +543,6 @@ impl ShardlessDiskIndex {
     }
 
     fn parse_seq_from_name(name: &str) -> Option<u64> {
-        // "sst.{16 hex}.ldb"
         if !name.starts_with("sst.") || !name.ends_with(".ldb") {
             return None;
         }
@@ -592,7 +566,6 @@ impl ShardlessDiskIndex {
                 }
             }
         }
-        // Newest first in the array for faster lookups.
         entries.sort_by(|a, b| b.0.cmp(&a.0));
         Ok((entries.into_iter().map(|(_, r)| r).collect(), max_seq))
     }
@@ -601,7 +574,6 @@ impl ShardlessDiskIndex {
         let dir = Self::index_dir(base)?;
         let (ssts_vec, max_seq) = Self::load_existing_ssts(&dir)?;
         let mut wal = Wal::open(&dir)?;
-        // Restore memtable from WAL if present
         let mut mem = BTreeMap::<u128, Entry>::new();
         for (tag, key, val) in wal.replay()? {
             match tag {
@@ -622,7 +594,6 @@ impl ShardlessDiskIndex {
 
     fn flush_memtable_locked(&self, mem_snapshot: BTreeMap<u128, Entry>) -> io::Result<()> {
         if mem_snapshot.is_empty() {
-            // Still reset WAL to cut it to zero length if there was residual.
             self.wal.lock().unwrap().reset()?;
             return Ok(());
         }
@@ -633,7 +604,6 @@ impl ShardlessDiskIndex {
         }
         let reader = Arc::new(SstReader::open(writer.finish()?.path, seq)?);
 
-        // Swap into live list (newest first):
         {
             let mut tables = self.ssts.write().unwrap();
             let mut newv = Vec::with_capacity(tables.len() + 1);
@@ -642,19 +612,16 @@ impl ShardlessDiskIndex {
             *tables = newv;
         }
 
-        // Reset WAL atomically after the SSTable is durable
         self.wal.lock().unwrap().reset()?;
         Ok(())
     }
 
     fn maybe_flush_and_compact(&self) -> io::Result<()> {
-        // Flush if memtable size reached threshold
         let do_flush = {
             let mem = self.mem.read().unwrap();
             mem.len() >= self.opts.memtable_max_entries
         };
         if do_flush {
-            // Swap out memtable content efficiently
             let snapshot = {
                 let mut mem = self.mem.write().unwrap();
                 std::mem::take(&mut *mem)
@@ -662,7 +629,6 @@ impl ShardlessDiskIndex {
             self.flush_memtable_locked(snapshot)?;
         }
 
-        // Compact if too many L0 files
         let do_compact = { self.ssts.read().unwrap().len() > self.opts.level0_compact_trigger };
         if do_compact {
             METRICS
@@ -675,30 +641,24 @@ impl ShardlessDiskIndex {
     }
 
     fn full_compaction(&self) -> io::Result<()> {
-        // Snapshot current tables
         let current = self.ssts.read().unwrap().clone();
         if current.len() <= 1 {
             return Ok(());
         }
 
-        // Create new compaction output
         let seq = self.seq.fetch_add(1, AtomOrdering::AcqRel);
         let mut writer = SstWriter::create(&self.dir, seq, self.opts.sst_block_entries)?;
 
-        // Build iterators (each is sorted ascending by key)
         let mut iters: Vec<_> = Vec::with_capacity(current.len());
         for t in &current {
             iters.push((t.seq, t.iter()?));
         }
 
-        // k-way merge using a binary heap:
-        // Since std::collections::BinaryHeap is a max-heap, wrap with Reverse.
         use std::collections::BinaryHeap;
 
         #[derive(Eq)]
         struct HeapElt {
             key: u128,
-            // Higher seq => newer.
             seq: u64,
             val: Option<u64>,
             src: usize,
@@ -715,18 +675,16 @@ impl ShardlessDiskIndex {
         }
         impl Ord for HeapElt {
             fn cmp(&self, other: &Self) -> Ordering {
-                // We want **min** by key; for equal keys, **max** by seq (newest first).
                 match self.key.cmp(&other.key) {
-                    Ordering::Less => Ordering::Greater, // reversed (min-heap via max-heap)
+                    Ordering::Less => Ordering::Greater,
                     Ordering::Greater => Ordering::Less,
-                    Ordering::Equal => self.seq.cmp(&other.seq), // newer (larger) is greater
+                    Ordering::Equal => self.seq.cmp(&other.seq),
                 }
             }
         }
 
         let mut heap: BinaryHeap<HeapElt> = BinaryHeap::new();
 
-        // Prime heap with first items
         for (i, (seq_i, iter)) in iters.iter_mut().enumerate() {
             if let Some(next) = iter.next() {
                 let it = next?;
@@ -742,20 +700,16 @@ impl ShardlessDiskIndex {
         let mut last_written_key: Option<u128> = None;
 
         while let Some(top) = heap.pop() {
-            // Drain all with this key, keeping the newest (largest seq) which is `top`
             if last_written_key == Some(top.key) {
-                // We've already written this key; consume duplicates only.
             } else {
-                // Emit top (newest) for this key
                 writer.push(
                     top.key,
                     Entry {
-                        val: top.val, // None → deletion tombstone; retained ONLY if overshadowing older values
+                        val: top.val,
                     },
                 )?;
                 last_written_key = Some(top.key);
             }
-            // Advance the iterator for the source of `top`
             let src = top.src;
             if let Some(next) = iters[src].1.next() {
                 let it = next?;
@@ -770,12 +724,10 @@ impl ShardlessDiskIndex {
 
         let new_reader = Arc::new(SstReader::open(writer.finish()?.path, seq)?);
 
-        // Atomically swap table list: new reader first; delete old files afterwards.
         {
             let mut w = self.ssts.write().unwrap();
             let old = std::mem::replace(&mut *w, vec![new_reader.clone()]);
             drop(w);
-            // Remove old files on disk (best-effort)
             for t in old {
                 let _ = fs::remove_file(&t.path);
             }
@@ -784,14 +736,10 @@ impl ShardlessDiskIndex {
         Ok(())
     }
 
-    // ------------------------------ API ops ---------------------------------
-
     fn get(&self, key: u128) -> io::Result<u64> {
-        // 1) memtable
         if let Some(e) = self.mem.read().unwrap().get(&key) {
             return Ok(e.val.unwrap_or(0));
         }
-        // 2) SSTables, newest first
         let ssts = self.ssts.read().unwrap().clone();
         for t in &ssts {
             if let Some(v) = t.get(key)? {
@@ -803,7 +751,6 @@ impl ShardlessDiskIndex {
 
     fn upsert(&self, key: u128, addr: u64) -> Result<UpsertResult, IndexError> {
         let _g = self.apply_lock.lock().unwrap();
-        // Record WAL then memtable
         {
             let mut wal = self.wal.lock().unwrap();
             wal.append_set(key, addr)?;
@@ -825,12 +772,10 @@ impl ShardlessDiskIndex {
 
     fn delete(&self, key: u128) -> io::Result<Option<u64>> {
         let _g = self.apply_lock.lock().unwrap();
-        // WAL
         {
             let mut wal = self.wal.lock().unwrap();
             wal.append_del(key)?;
         }
-        // Memtable: store a deletion tombstone (None)
         let prev = self.mem.write().unwrap().insert(key, Entry { val: None });
         self.maybe_flush_and_compact()?;
         Ok(prev.and_then(|e| e.val))
@@ -849,37 +794,28 @@ impl ShardlessDiskIndex {
     }
 }
 
-// =============================== Public wrapper ==============================
-
-/// Public name preserved for compatibility with the rest of the codebase.
 pub struct ShardedIndex {
     inner: ShardlessDiskIndex,
 }
 
 impl ShardedIndex {
-    /// Open or create a disk-backed index under `dir`.
     pub fn open(dir: &Path, opts: IndexOptions) -> io::Result<Self> {
         let inner = ShardlessDiskIndex::open_internal(dir, opts)?;
         Ok(Self { inner })
     }
 
-    /// Get the latest mapped address for `key` (0 if not present).
     pub fn get(&self, key: u128) -> u64 {
-        // Swallow IO errors as 0 (consistent with prior behavior returning 0 on miss)
         self.inner.get(key).unwrap_or(0)
     }
 
-    /// Insert or replace mapping: key → addr.
     pub fn upsert(&self, key: u128, addr: u64) -> Result<UpsertResult, IndexError> {
         self.inner.upsert(key, addr)
     }
 
-    /// Remove mapping for `key` (LSM tombstone). Returns previous addr if any.
     pub fn delete(&self, key: u128) -> Option<u64> {
         self.inner.delete(key).ok().flatten()
     }
 
-    /// Visible to the engine bootstrapper to avoid segment scanning when we already have data.
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count().unwrap_or(0)
     }

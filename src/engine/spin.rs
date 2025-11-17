@@ -1,5 +1,3 @@
-// SAFETY: This module uses unsafe for zero-cost interior mutability.
-// SpinLock provides fast, uncontended locking.
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct SpinLock {

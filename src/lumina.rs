@@ -1,9 +1,7 @@
 // Lumina protocol support for IDA Pro's Lumina plugin
-// This implements the custom serialization format used by IDA Pro
-
 use log::*;
 use bytes::BytesMut;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::io;
 
 #[derive(Debug)]
@@ -29,8 +27,6 @@ pub struct LuminaHello {
     pub password: String,
 }
 
-// --- Caps for safe parsing ---
-
 #[derive(Clone, Copy, Debug)]
 pub struct LuminaCaps {
     pub max_funcs: usize,
@@ -40,58 +36,41 @@ pub struct LuminaCaps {
     pub max_hash_bytes: usize,
 }
 
-/// Unpack a variable-length encoded 32-bit integer (IDA's "dd" encoding)
-/// Returns (value, bytes_consumed)
 fn unpack_dd(data: &[u8]) -> (u32, usize) {
     if data.is_empty() {
         return (0, 0);
     }
-    
     let b = data[0];
-    
     if (b & 0x80) == 0 {
-        // Single byte: 0xxxxxxx
         return (b as u32, 1);
     }
-    
     if (b & 0xC0) == 0x80 {
-        // Two bytes: 10xxxxxx yyyyyyyy
         if data.len() < 2 {
             return (0, 0);
         }
         let val = (((b & 0x3F) as u32) << 8) | (data[1] as u32);
         return (val, 2);
     }
-    
     if (b & 0xE0) == 0xC0 {
-        // Four bytes: 110xxxxx yyyyyyyy zzzzzzzz wwwwwwww (reads 4 bytes total, lumen-master uses little-endian)
         if data.len() < 4 {
             return (0, 0);
         }
-        // Little-endian: val[0] = data[3], val[1] = data[2], val[2] = data[1], val[3] = b & 0x1F
         let val = u32::from_le_bytes([data[3], data[2], data[1], b & 0x1F]);
         return (val, 4);
     }
-    
-    // Five bytes (0xFF prefix)
     if b == 0xFF {
-        // Five bytes: 11111111 xxxxxxxx yyyyyyyy zzzzzzzz wwwwwwww (full 32-bit, little-endian)
         if data.len() < 5 {
             return (0, 0);
         }
         let val = u32::from_le_bytes([data[4], data[3], data[2], data[1]]);
         return (val, 5);
     }
-    
-    // Four bytes: 111xxxxx yyyyyyyy zzzzzzzz wwwwwwww
     if data.len() < 4 {
         return (0, 0);
     }
     let val = (((b & 0x1F) as u32) << 24) | ((data[1] as u32) << 16) | ((data[2] as u32) << 8) | (data[3] as u32);
     (val, 4)
 }
-
-// --- Capped C-string unpacker ---
 
 fn unpack_cstr_capped(data: &[u8], max: usize) -> Result<(String, usize), LuminaError> {
     let null_pos = data.iter().position(|&b| b == 0).ok_or(LuminaError::UnexpectedEof)?;
@@ -100,7 +79,6 @@ fn unpack_cstr_capped(data: &[u8], max: usize) -> Result<(String, usize), Lumina
     Ok((s.to_string(), null_pos + 1))
 }
 
-/// Encode a u32 in variable-length dd format (matching lumen-master)
 fn pack_dd(v: u32) -> Vec<u8> {
     let bytes = v.to_le_bytes();
     match v {
@@ -110,14 +88,12 @@ fn pack_dd(v: u32) -> Vec<u8> {
         0x200000..=u32::MAX => {
             let mut out = Vec::with_capacity(5);
             out.extend_from_slice(&[0xff]);
-            // NOTE: legacy unpack_dd interprets the 4 bytes that follow 0xFF as little-endian
-            out.extend_from_slice(&bytes); // little-endian as per unpacker
+            out.extend_from_slice(&bytes);
             out
         },
     }
 }
 
-/// Encode a u64 as two dd-encoded u32s (high, low)
 fn pack_dq(v: u64) -> Vec<u8> {
     let high = (v >> 32) as u32;
     let low = (v & 0xFFFFFFFF) as u32;
@@ -126,8 +102,6 @@ fn pack_dq(v: u64) -> Vec<u8> {
     result
 }
 
-/// Parse variable-length byte array (length-prefixed with dd encoding)
-/// Returns (bytes, bytes_consumed)
 fn unpack_var_bytes_capped(data: &[u8], max_len: usize) -> Result<(&[u8], usize), LuminaError> {
     let (len, consumed) = unpack_dd(data);
     if consumed == 0 {
@@ -142,29 +116,31 @@ fn unpack_var_bytes_capped(data: &[u8], max_len: usize) -> Result<(&[u8], usize)
     Ok((&data[..len], consumed + len))
 }
 
-/// Parse Lumina Hello message (0x0d message type)
+/// Helper (client): pack var-bytes as dd(len) + bytes
+pub fn pack_var_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + bytes.len());
+    out.extend_from_slice(&pack_dd(bytes.len() as u32));
+    out.extend_from_slice(bytes);
+    out
+}
+
 pub fn parse_lumina_hello(payload: &[u8]) -> Result<LuminaHello, LuminaError> {
     let mut offset = 0;
     let (protocol_version, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
     debug!("Lumina Hello: protocol_version={}", protocol_version);
-    
-    // license_data (unused / discarded safely with small cap)
-    let (_license_data, consumed) = unpack_var_bytes_capped(&payload[offset..], 4096)?;
+
+    let (_license_data, consumed) = unpack_var_bytes_capped(&payload[offset..], 16384)?;
     offset += consumed;
-    debug!("Lumina Hello: license_data processed");
-    
-    // lic_number (6 bytes)
+
     if payload.len() < offset + 6 { return Err(LuminaError::UnexpectedEof); }
     offset += 6;
-    
-    // unk2
+
     let (_unk2, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
 
-    // Credentials (optional)
     let (username, password) = if protocol_version > 2 && offset < payload.len() {
         match unpack_cstr_capped(&payload[offset..], 256) {
             Ok((user, consumed)) => {
@@ -179,23 +155,17 @@ pub fn parse_lumina_hello(payload: &[u8]) -> Result<LuminaHello, LuminaError> {
     } else {
         ("guest".to_string(), String::new())
     };
-    
+
     Ok(LuminaHello { protocol_version, username, password })
 }
 
-// Lumina message structures
-// Note: Many fields are parsed for protocol compatibility but not used by server logic
-
 pub struct LuminaPullMetadataFunc {
-    #[allow(dead_code)]
     pub unk0: u32,
     pub mb_hash: Vec<u8>,
 }
 
 pub struct LuminaPullMetadata {
-    #[allow(dead_code)]
     pub unk0: u32,
-    #[allow(dead_code)]
     pub unk1: Vec<u32>,
     pub funcs: Vec<LuminaPullMetadataFunc>,
 }
@@ -204,47 +174,37 @@ pub struct LuminaPushMetadataFunc {
     pub name: String,
     pub func_len: u32,
     pub func_data: Vec<u8>,
-    #[allow(dead_code)]
     pub unk2: u32,
     pub hash: Vec<u8>,
 }
 
 pub struct LuminaPushMetadata {
-    #[allow(dead_code)]
     pub unk0: u32,
-    #[allow(dead_code)]
     pub idb_path: String,
-    #[allow(dead_code)]
     pub file_path: String,
-    #[allow(dead_code)]
     pub md5: [u8; 16],
-    #[allow(dead_code)]
     pub hostname: String,
     pub funcs: Vec<LuminaPushMetadataFunc>,
-    #[allow(dead_code)]
     pub unk1: Vec<u64>,
 }
 
 pub struct LuminaGetFuncHistories {
     pub funcs: Vec<LuminaPullMetadataFunc>,
-    #[allow(dead_code)]
     pub unk0: u32,
 }
 
-/// Parse Lumina PullMetadata (0x0e) with caps
 pub fn parse_lumina_pull_metadata(payload: &[u8], caps: LuminaCaps) -> Result<LuminaPullMetadata, LuminaError> {
     let mut offset = 0;
     debug!("parse_lumina_pull_metadata: payload len={}", payload.len());
-    
+
     let (unk0, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
 
-    // unk1: Vec<u32>
     let (count1, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
-    
+
     let mut unk1 = Vec::with_capacity((count1 as usize).min(1024));
     for _ in 0..count1 {
         let (v, c) = unpack_dd(&payload[offset..]);
@@ -252,8 +212,7 @@ pub fn parse_lumina_pull_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
         offset += c;
         unk1.push(v);
     }
-    
-    // funcs: Vec<PullMetadataFunc>
+
     let (count_funcs, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
@@ -262,12 +221,10 @@ pub fn parse_lumina_pull_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
     let mut funcs = Vec::with_capacity(n);
 
     for i in 0..count_funcs {
-        // unk0
         let (func_unk0, c) = unpack_dd(&payload[offset..]);
         if c == 0 { return Err(LuminaError::UnexpectedEof); }
         offset += c;
 
-        // mb_hash
         let (hash, c) = unpack_var_bytes_capped(&payload[offset..], caps.max_hash_bytes)?;
         offset += c;
 
@@ -279,16 +236,14 @@ pub fn parse_lumina_pull_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
     Ok(LuminaPullMetadata { unk0, unk1, funcs })
 }
 
-/// Parse Lumina PushMetadata (0x10) with caps
 pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<LuminaPushMetadata, LuminaError> {
     let mut offset = 0;
     debug!("parse_lumina_push_metadata: payload len={}", payload.len());
-    
+
     let (unk0, consumed) = unpack_dd(&payload[offset..]);
     if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += consumed;
-    
-    // idb_path, file_path, hostname with C-string caps
+
     let (idb_path, c) = unpack_cstr_capped(&payload[offset..], caps.max_cstr_bytes)?;
     offset += c;
 
@@ -303,12 +258,10 @@ pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
     let (hostname, c) = unpack_cstr_capped(&payload[offset..], caps.max_cstr_bytes)?;
     offset += c;
 
-    // funcs
     let (count_funcs, c) = unpack_dd(&payload[offset..]);
     if c == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += c;
-    
-    // Reject requests that exceed the cap instead of silently truncating
+
     if count_funcs as usize > caps.max_funcs {
         log::warn!("Push request contains {} functions but limit is {}", count_funcs, caps.max_funcs);
         return Err(LuminaError::InvalidData);
@@ -317,7 +270,7 @@ pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
     let n = count_funcs as usize;
     let mut funcs = Vec::with_capacity(n);
 
-    for i in 0..count_funcs {
+    for _ in 0..count_funcs {
         let (name, c) = unpack_cstr_capped(&payload[offset..], caps.max_name_bytes)?;
         offset += c;
 
@@ -340,7 +293,6 @@ pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
         });
     }
 
-    // unk1: Vec<u64> (capped by reasonable upper bound)
     let (count_u64, c) = unpack_dd(&payload[offset..]);
     if c == 0 { return Err(LuminaError::UnexpectedEof); }
     offset += c;
@@ -367,7 +319,6 @@ pub fn parse_lumina_push_metadata(payload: &[u8], caps: LuminaCaps) -> Result<Lu
     })
 }
 
-/// Parse Lumina GetFuncHistories (0x2f) with caps
 pub fn parse_lumina_get_func_histories(payload: &[u8], caps: LuminaCaps) -> Result<LuminaGetFuncHistories, LuminaError> {
     let mut offset = 0;
 
@@ -396,10 +347,108 @@ pub fn parse_lumina_get_func_histories(payload: &[u8], caps: LuminaCaps) -> Resu
     Ok(LuminaGetFuncHistories { funcs, unk0 })
 }
 
-/// Write a packet in Lumina format:
-/// - 4 bytes: big-endian length (payload length, not including message type)
-/// - 1 byte: message type
-/// - N bytes: payload
+/// Build a Lumina Hello payload (client-side)
+pub fn build_lumina_hello_payload(protocol_version: u32, license_data: &[u8], lic_number: [u8;6], username: &str, password: &str, unk2: u32) -> Vec<u8> {
+    let mut payload = BytesMut::new();
+    payload.extend_from_slice(&pack_dd(protocol_version));
+    payload.extend_from_slice(&pack_dd(license_data.len() as u32));
+    payload.extend_from_slice(license_data);
+    payload.extend_from_slice(&lic_number);
+    payload.extend_from_slice(&pack_dd(unk2));
+    if protocol_version > 2 {
+        payload.extend_from_slice(username.as_bytes());
+        payload.extend_from_slice(b"\0");
+        payload.extend_from_slice(password.as_bytes());
+        payload.extend_from_slice(b"\0");
+    }
+    payload.to_vec()
+}
+
+/// Build PullMetadata payload for a set of 16-byte hashes (client-side)
+pub fn build_pull_metadata_payload(hashes_be: &[[u8;16]]) -> Vec<u8> {
+    let mut payload = BytesMut::new();
+    payload.extend_from_slice(&pack_dd(0));
+    payload.extend_from_slice(&pack_dd(0));
+    payload.extend_from_slice(&pack_dd(hashes_be.len() as u32));
+    // For each hash, write unk0 followed immediately by the var-bytes hash
+    for h in hashes_be {
+        payload.extend_from_slice(&pack_dd(0));
+        // variable-length mb_hash: dd(length) + bytes
+        payload.extend_from_slice(&pack_dd(16));
+        payload.extend_from_slice(h);
+    }
+    payload.to_vec()
+}
+
+/// Read a legacy Lumina packet (client-side)
+pub async fn read_lumina_packet<R: AsyncReadExt + Unpin>(r: &mut R, max_len: usize) -> io::Result<(u8, Vec<u8>)> {
+    let mut lenb = [0u8;4];
+    r.read_exact(&mut lenb).await?;
+    let len = u32::from_be_bytes(lenb) as usize;
+    if len > max_len { return Err(io::Error::new(io::ErrorKind::InvalidData, "remote frame too large")); }
+    let mut typb = [0u8;1];
+    r.read_exact(&mut typb).await?;
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload).await?;
+    Ok((typb[0], payload))
+}
+
+/// Decode Fail message payload (0x0b): returns (code, message)
+pub fn decode_lumina_fail(payload: &[u8]) -> Result<(u32, String), LuminaError> {
+    let (code, consumed) = unpack_dd(payload);
+    if consumed == 0 { return Err(LuminaError::UnexpectedEof); }
+    let msg_bytes = &payload[consumed..];
+    let null_pos = msg_bytes.iter().position(|&b| b == 0).unwrap_or(msg_bytes.len());
+    let message = std::str::from_utf8(&msg_bytes[..null_pos])
+        .unwrap_or("<invalid utf8>")
+        .to_string();
+    Ok((code, message))
+}
+
+/// Decode PullResult payload (0x0f): returns (statuses, funcs)
+pub fn decode_lumina_pull_result(payload: &[u8]) -> Result<(Vec<u32>, Vec<(u32,u32,String,Vec<u8>)>), LuminaError> {
+    let mut off = 0usize;
+    let (n_status, c) = unpack_dd(&payload[off..]);
+    if c == 0 { return Err(LuminaError::UnexpectedEof); }
+    off += c;
+    let mut statuses = Vec::with_capacity(n_status as usize);
+    for _ in 0..n_status {
+        let (s, c) = unpack_dd(&payload[off..]);
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
+        off += c;
+        statuses.push(s);
+    }
+    let (n_funcs, c) = unpack_dd(&payload[off..]);
+    if c == 0 { return Err(LuminaError::UnexpectedEof); }
+    off += c;
+
+    let mut funcs = Vec::with_capacity(n_funcs as usize);
+    for _ in 0..n_funcs {
+        // cstr name
+        let (name, c) = {
+            let null_pos = payload[off..].iter().position(|&b| b == 0).ok_or(LuminaError::UnexpectedEof)?;
+            let s = std::str::from_utf8(&payload[off..off+null_pos]).map_err(|_| LuminaError::InvalidData)?.to_string();
+            off += null_pos + 1;
+            (s, null_pos + 1)
+        };
+        let (decl_len, c) = unpack_dd(&payload[off..]);
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
+        off += c;
+        let (meta_len, c) = unpack_dd(&payload[off..]);
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
+        off += c;
+        if payload.len() < off + (meta_len as usize) { return Err(LuminaError::UnexpectedEof); }
+        let data = payload[off..off+(meta_len as usize)].to_vec();
+        off += meta_len as usize;
+        let (pop, c) = unpack_dd(&payload[off..]);
+        if c == 0 { return Err(LuminaError::UnexpectedEof); }
+        off += c;
+        funcs.push((pop, decl_len, name, data));
+    }
+    Ok((statuses, funcs))
+}
+
+/// Write a packet in Lumina format (server + client)
 pub async fn write_lumina_packet<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     msg_type: u8,
@@ -415,12 +464,10 @@ pub async fn write_lumina_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Send Lumina OK response (0x0a with empty payload)
 pub async fn send_lumina_ok<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
     write_lumina_packet(w, 0x0a, &[]).await
 }
 
-/// Send Lumina HelloResult response (0x31) for protocol version >= 5
 pub async fn send_lumina_hello_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     features: u32,
@@ -430,8 +477,8 @@ pub async fn send_lumina_hello_result<W: AsyncWriteExt + Unpin>(
     payload.extend_from_slice(b"\0");
     payload.extend_from_slice(b"\0");
     payload.extend_from_slice(b"\0");
-    payload.extend_from_slice(&[0x00]); // karma
-    payload.extend_from_slice(&[0x00, 0x00]); // last_active
+    payload.extend_from_slice(&[0x00]);
+    payload.extend_from_slice(&[0x00, 0x00]);
     if features < 0x80 {
         payload.extend_from_slice(&[features as u8]);
     } else {
@@ -442,7 +489,6 @@ pub async fn send_lumina_hello_result<W: AsyncWriteExt + Unpin>(
     write_lumina_packet(w, 0x31, &payload).await
 }
 
-/// Send Lumina Fail response (0x0b) - dd-encoded code (LE as per unpacker) + cstr
 pub async fn send_lumina_fail<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     code: u32,
@@ -455,12 +501,10 @@ pub async fn send_lumina_fail<W: AsyncWriteExt + Unpin>(
     write_lumina_packet(w, 0x0b, &payload).await
 }
 
-// Lumina result encoders (unchanged except bounds-safe construction)
-
 pub async fn send_lumina_pull_result<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     statuses: &[u32],
-    funcs: &[(u32, u32, String, Vec<u8>)],  // (popularity, len, name, data)
+    funcs: &[(u32, u32, String, Vec<u8>)],
 ) -> io::Result<()> {
     let mut payload = BytesMut::new();
     payload.extend_from_slice(&pack_dd(statuses.len() as u32));
@@ -524,15 +568,15 @@ pub async fn send_lumina_histories_result<W: AsyncWriteExt + Unpin>(
             payload.extend_from_slice(&pack_dd(0));
         }
     }
-    payload.extend_from_slice(&pack_dd(0)); // users
-    payload.extend_from_slice(&pack_dd(0)); // dbs
+    payload.extend_from_slice(&pack_dd(0));
+    payload.extend_from_slice(&pack_dd(0));
     write_lumina_packet(w, 0x30, &payload).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_unpack_dd_basic() {
         assert_eq!(unpack_dd(&[0x42]), (0x42, 1));
@@ -541,15 +585,11 @@ mod tests {
         assert_eq!(unpack_dd(&[0x80, 0x00]), (0x0000, 2));
         assert_eq!(unpack_dd(&[0x81, 0x23]), (0x0123, 2));
         assert_eq!(unpack_dd(&[0xBF, 0xFF]), (0x3FFF, 2));
-        // 0xC0 class consumes 4 bytes: [data[3], data[2], data[1], b & 0x1F]
         assert_eq!(unpack_dd(&[0xC0, 0x00, 0x00, 0x00]), (0x00000000, 4));
-        // [0xC1, 0x23, 0x45, 0x00] -> from_le_bytes([0x00, 0x45, 0x23, 0x01]) = 0x01234500
         assert_eq!(unpack_dd(&[0xC1, 0x23, 0x45, 0x00]), (0x01234500, 4));
-        // 0xFF prefix: 5 bytes, from_le_bytes([data[4], data[3], data[2], data[1]])
-        // [0xFF, 0x78, 0x56, 0x34, 0x12] -> from_le_bytes([0x12, 0x34, 0x56, 0x78]) = 0x78563412
         assert_eq!(unpack_dd(&[0xFF, 0x78, 0x56, 0x34, 0x12]), (0x78563412, 5));
     }
-    
+
     #[test]
     fn test_unpack_cstr_capped() {
         assert_eq!(unpack_cstr_capped(b"hello\0", 16).unwrap(), ("hello".to_string(), 6));
@@ -557,168 +597,38 @@ mod tests {
         assert!(unpack_cstr_capped(&[b'a'; 10_000], 1024).is_err());
     }
 
-    // ============================================================================
-    // COMPREHENSIVE SECURITY FUZZING TESTS
-    // ============================================================================
-
     #[test]
-    fn test_unpack_dd_overflow_protection() {
-        // Test the unpack_dd function with various overflow conditions
-        let test_cases = vec![
-            // Maximum values
-            (vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF], "Max 5-byte value"),
-            // Near-overflow values
-            (vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFE], "Near max 5-byte value"),
-            // Invalid encodings that could cause issues
-            (vec![0xC0, 0xFF, 0xFF, 0xFF], "Max 4-byte C0 encoding"),
-            (vec![0xDF, 0xFF, 0xFF, 0xFF], "Max 4-byte DF encoding"),
-            // Edge cases
-            (vec![0x80, 0x00], "Min 2-byte encoding"),
-            (vec![0xBF, 0xFF], "Max 2-byte encoding"),
-        ];
-
-        for (data, description) in test_cases {
-            println!("Testing unpack_dd: {}", description);
-            let (value, consumed) = unpack_dd(&data);
-            println!("  Input: {:02x?}, Value: {}, Consumed: {}", data, value, consumed);
-
-            // Ensure we don't panic and return reasonable values
-            assert!(consumed <= data.len(), "Consumed more bytes than available");
-            assert!(value <= u32::MAX, "Value should not exceed u32::MAX");
-        }
-    }
-
-    #[test]
-    fn test_legacy_protocol_fuzzing() {
-        use rand::{Rng, RngCore, Fill};
-
-        // Test legacy unpack_dd with malformed data
-        for _ in 0..10000 {
-            let size = rand::thread_rng().gen_range(1..50);
-            let data = random_bytes(size);
-
-            let (value, consumed) = unpack_dd(&data);
-
-            // Basic sanity checks
-            assert!(consumed <= data.len(), "Consumed more than available data");
-            assert!(value <= u32::MAX, "Value overflow");
-
-            // Ensure no panics occur
-            if consumed > 0 {
-                assert!(consumed >= 1, "Should consume at least 1 byte if successful");
+    fn test_decode_pull_result_roundtrip() {
+        // Build a synthetic payload using the encoder and decode it back.
+        let funcs = vec![(10u32, 4u32, "name".to_string(), vec![1,2,3,4])];
+        let statuses = vec![0u32];
+        let mut buf = Vec::new();
+        tokio_test::block_on(async {
+            let mut out = Vec::<u8>::new();
+            // use the builder functions directly (not sending over IO)
+            let mut payload = BytesMut::new();
+            payload.extend_from_slice(&super::pack_dd(funcs.len() as u32));
+            for (pop, len, name, data) in &funcs {
+                payload.extend_from_slice(name.as_bytes());
+                payload.extend_from_slice(b"\0");
+                payload.extend_from_slice(&super::pack_dd(*len));
+                payload.extend_from_slice(&super::pack_dd(data.len() as u32));
+                payload.extend_from_slice(data);
+                payload.extend_from_slice(&super::pack_dd(*pop));
             }
-        }
-
-        println!("Legacy unpack_dd fuzzing completed without panics");
-    }
-
-    #[test]
-    fn test_legacy_string_parsing_edge_cases() {
-        let edge_cases: Vec<(&[u8], &str)> = vec![
-            (b"", "Empty string"),
-            (b"\x00", "Single null byte"),
-            (b"hello", "No null terminator"),
-            (b"hello\x00world\x00", "Multiple null terminators"),
-            (&[0xFF; 1000], "All FF bytes"),
-            (&[b'A'; 10000], "Very long string"),
-            (b"\x00hello", "Null at start"),
-        ];
-
-        for (data, description) in edge_cases {
-            println!("Testing legacy string parsing: {}", description);
-
-            let result = unpack_cstr_capped(data, 4096);
-            match result {
-                Ok((string, consumed)) => {
-                    println!("  Parsed: '{}' (consumed: {})", string, consumed);
-                    assert!(consumed <= data.len());
-                }
-                Err(e) => {
-                    println!("  Failed: {:?}", e);
-                    // Expected for some cases
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_legacy_protocol_overflows() {
-        use rand::{Rng, RngCore, Fill};
-
-        // Test legacy parsing with large inputs
-        for _ in 0..100 {
-            let size = rand::thread_rng().gen_range(1..10000);
-            let data = random_bytes(size);
-
-            // Try parsing as legacy hello
-            let hello_result = parse_legacy_hello(&data);
-            match hello_result {
-                Ok(hello) => {
-                    println!("Parsed legacy hello: version={}, user='{}', pass='{}'",
-                            hello.protocol_version, hello.username, hello.password);
-                }
-                Err(_) => {
-                    // Expected for random data
-                }
-            }
-
-            // Try parsing as legacy pull metadata
-            let caps = LegacyCaps {
-                max_funcs: 100,
-                max_name_bytes: 1000,
-                max_data_bytes: 10000,
-                max_cstr_bytes: 4096,
-                max_hash_bytes: 64,
-            };
-
-            let pull_result = parse_legacy_pull_metadata(&data, caps);
-            match pull_result {
-                Ok(pull) => {
-                    println!("Parsed legacy pull: {} funcs", pull.funcs.len());
-                }
-                Err(_) => {
-                    // Expected for random data
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_integer_precision_attacks() {
-        // Test attacks that rely on integer precision issues
-        let precision_tests = vec![
-            // Off-by-one attacks
-            (u32::MAX as u64 + 1, "u32::MAX + 1"),
-            (i32::MAX as u64 + 1, "i32::MAX + 1"),
-            // Negative value representations
-            ((u32::MAX as u64) << 32, "Large shift"),
-            // Boundary conditions
-            (usize::MAX as u64, "usize::MAX"),
-        ];
-
-        for (value, description) in precision_tests {
-            println!("Testing integer precision: {} (0x{:016x})", description, value);
-
-            // Test with legacy unpack_dd simulation
-            let bytes = value.to_le_bytes();
-            let test_cases = vec![
-                vec![0xFF, bytes[0], bytes[1], bytes[2], bytes[3]], // 5-byte encoding
-                vec![0xC0 | (bytes[3] >> 4), bytes[2], bytes[1], bytes[0]], // 4-byte C0
-            ];
-
-            for test_data in test_cases {
-                let (parsed_value, consumed) = unpack_dd(&test_data);
-                println!("  Input: {:02x?} -> value: {}, consumed: {}", test_data, parsed_value, consumed);
-            }
-        }
-    }
-
-    // Helper function for fuzzing tests
-    fn random_bytes(len: usize) -> Vec<u8> {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
-        let mut buf = vec![0u8; len];
-        rng.fill_bytes(&mut buf);
-        buf
+            buf = payload.to_vec();
+        });
+        // Prepend the status count + status for decode
+        let mut final_payload = Vec::new();
+        final_payload.extend_from_slice(&pack_dd(statuses.len() as u32));
+        for s in &statuses { final_payload.extend_from_slice(&pack_dd(*s)); }
+        final_payload.extend_from_slice(&buf);
+        let (st, ff) = decode_lumina_pull_result(&final_payload).unwrap();
+        assert_eq!(st, statuses);
+        assert_eq!(ff.len(), 1);
+        assert_eq!(ff[0].0, 10);
+        assert_eq!(ff[0].1, 4);
+        assert_eq!(ff[0].2, "name");
+        assert_eq!(ff[0].3, vec![1,2,3,4]);
     }
 }

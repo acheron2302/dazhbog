@@ -7,8 +7,6 @@ use tokio::{
 };
 use tokio::io::AsyncReadExt;
 
-// ---- In-flight budgeting primitives (per-connection and global) ----
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Budget {
@@ -56,24 +54,15 @@ impl OwnedFrame {
     fn as_slice(&self) -> &[u8] { &self.buf }
 }
 
-// Multi-protocol bounded reader.
-//
-// Wire length L semantics:
-//   - New protocol: L = 1 (type) + payload_len.
-//   - Legacy protocol: L = payload_len (type byte is *separate* on wire).
-//
-// This reader always returns a buffer beginning with the message type byte,
-// followed by payload bytes, i.e. [type | payload...].
-async fn read_multiproto_bounded<R: AsyncReadExt + Unpin>(
+async fn read_multiproto_bounded<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
-    is_legacy: Option<bool>, // None during hello; Some(true/false) otherwise
-    max_len_field: usize,    // max allowed wire length L
+    is_legacy: Option<bool>,
+    max_len_field: usize,
     conn_budget: &Arc<Budget>,
     global_budget: &Arc<Budget>,
 ) -> io::Result<OwnedFrame> {
     let mut head = [0u8; 5];
 
-    // read 4B wire length first
     r.read_exact(&mut head[..4]).await?;
     let len_field = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
 
@@ -81,32 +70,24 @@ async fn read_multiproto_bounded<R: AsyncReadExt + Unpin>(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
     }
 
-    // read the message type byte
     r.read_exact(&mut head[4..5]).await?;
     let typ = head[4];
 
-    // determine payload_to_read based on protocol
     let is_legacy_final = if let Some(b) = is_legacy {
         b
     } else {
-        // during hello: infer from the code
-        // legacy hello uses 0x0d; new hello uses 0x01
         typ == 0x0d
     };
 
     let to_read_payload = if is_legacy_final {
-        // legacy: len_field is payload length (excludes type)
         len_field
     } else {
-        // new: len_field includes the 1-byte type
         if len_field == 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid length")); }
         len_field - 1
     };
 
-    // total buffer we will hold in memory for this frame
     let total_buf = 1usize.checked_add(to_read_payload).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "length overflow"))?;
 
-    // reserve budgets BEFORE allocation and read
     let g1 = conn_budget.clone().try_reserve(total_buf).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "per-connection memory budget exceeded"))?;
     let g2 = global_budget.clone().try_reserve(total_buf).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "global memory budget exceeded"))?;
 
@@ -125,7 +106,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let conn_budget = Arc::new(Budget::new(cfg.limits.per_connection_inflight_bytes));
 
-    // --- Hello: read in multi-protocol mode with hello limits ---
     let hello_frame = match timeout(
         Duration::from_millis(cfg.limits.hello_timeout_ms),
         read_multiproto_bounded(&mut stream, None, cfg.limits.max_hello_frame_bytes, &conn_budget, &global_budget)
@@ -156,7 +136,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     const LUMINA_MSG_HELLO: u8 = 0x0d;
     let is_lumina = msg_type == LUMINA_MSG_HELLO;
 
-    // Parse hello according to protocol
     let hello = if is_lumina {
         debug!("Detected Lumina Hello message (0x0d)");
         match lumina::parse_lumina_hello(payload) {
@@ -192,7 +171,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    // Protocol split: ≤4 expects empty OK; ≥5 expects HelloResult{features}
     if is_lumina {
         if hello.protocol_version <= 4 {
             lumina::send_lumina_ok(&mut stream).await?;
@@ -211,7 +189,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         }
     }
 
-    // --- Command loop: budgeted frame reads with command caps ---
     loop {
         let frame = if is_lumina {
             match timeout(
@@ -260,7 +237,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         debug!("Incoming message: type=0x{:02x}, payload_size={}", typ, pld.len());
 
         if is_lumina {
-            // --- Lumina command handling with caps ---
             debug!("Lumina command received: 0x{:02x}", typ);
 
             match typ {
@@ -282,37 +258,100 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         }
                     };
 
-                    debug!("Lumina PULL request: {} keys", pull_msg.funcs.len());
-                    METRICS.queried_funcs.fetch_add(pull_msg.funcs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    
-                    let mut statuses = Vec::with_capacity(pull_msg.funcs.len());
-                    let mut found = Vec::new();
-                    
+                    // Collect keys in request order
+                    let mut keys: Vec<u128> = Vec::with_capacity(pull_msg.funcs.len());
                     for func in &pull_msg.funcs {
                         if func.mb_hash.len() != 16 {
-                            statuses.push(1);
-                            continue;
-                        }
-                        let key = u128::from_be_bytes([
-                            func.mb_hash[0], func.mb_hash[1], func.mb_hash[2], func.mb_hash[3],
-                            func.mb_hash[4], func.mb_hash[5], func.mb_hash[6], func.mb_hash[7],
-                            func.mb_hash[8], func.mb_hash[9], func.mb_hash[10], func.mb_hash[11],
-                            func.mb_hash[12], func.mb_hash[13], func.mb_hash[14], func.mb_hash[15],
-                        ]);
-                        
-                        match db.get_latest(key).await {
-                            Ok(Some(f)) => {
-                                statuses.push(0);
-                                found.push((f.popularity, f.len_bytes, f.name, f.data));
-                            },
-                            Ok(None) => { statuses.push(1); },
-                            Err(e) => { error!("db pull: {}", e); statuses.push(1); }
+                            keys.push(0); // placeholder; will be treated as missing/not found
+                        } else {
+                            let key = u128::from_be_bytes([
+                                func.mb_hash[0], func.mb_hash[1], func.mb_hash[2], func.mb_hash[3],
+                                func.mb_hash[4], func.mb_hash[5], func.mb_hash[6], func.mb_hash[7],
+                                func.mb_hash[8], func.mb_hash[9], func.mb_hash[10], func.mb_hash[11],
+                                func.mb_hash[12], func.mb_hash[13], func.mb_hash[14], func.mb_hash[15],
+                            ]);
+                            keys.push(key);
                         }
                     }
-                    
-                    METRICS.pulls.fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    debug!("Lumina PULL response: {} found, {} not found", found.len(), statuses.iter().filter(|&&s| s == 1).count());
-                    lumina::send_lumina_pull_result(&mut stream, &statuses, &found).await?;
+
+                    let mut maybe_funcs: Vec<Option<(u32,u32,String,Vec<u8>)>> = vec![None; keys.len()];
+                    let mut statuses: Vec<u32> = vec![1; keys.len()];
+
+                    METRICS.queried_funcs.fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+                    for (i, &k) in keys.iter().enumerate() {
+                        if k == 0 { statuses[i] = 1; continue; }
+                        match db.get_latest(k).await {
+                            Ok(Some(f)) => {
+                                statuses[i] = 0;
+                                maybe_funcs[i] = Some((f.popularity, f.len_bytes, f.name, f.data));
+                            },
+                            Ok(None) => { statuses[i] = 1; },
+                            Err(e) => { error!("db pull: {}", e); statuses[i] = 1; }
+                        }
+                    }
+
+                    // Upstream fetch for remaining misses
+                    if let Some(ref up) = cfg.upstream {
+                        if up.enabled {
+                            let mut missing_keys = Vec::new();
+                            let mut missing_pos = Vec::new();
+                            for (i, (&k, st)) in keys.iter().zip(statuses.iter()).enumerate() {
+                                if k != 0 && *st == 1 {
+                                    missing_keys.push(k);
+                                    missing_pos.push(i);
+                                }
+                            }
+                            if !missing_keys.is_empty() {
+                                METRICS.upstream_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                match crate::upstream::fetch_from_upstream(up.clone(), &missing_keys).await {
+                                Ok(fetched) => {
+                                    let mut new_inserts_owned: Vec<(u128, u32, u32, String, Vec<u8>)> = Vec::new();
+                                    let mut found_count = 0u64;
+                                    for (j, item) in fetched.into_iter().enumerate() {
+                                        let idx = missing_pos[j];
+                                        if let Some((pop, len, name, data)) = item {
+                                            statuses[idx] = 0;
+                                            new_inserts_owned.push((missing_keys[j], pop, len, name.clone(), data.clone()));
+                                            maybe_funcs[idx] = Some((pop, len, name, data));
+                                            found_count += 1;
+                                        }
+                                    }
+                                    let new_inserts: Vec<(u128, u32, u32, &str, &[u8])> = new_inserts_owned.iter()
+                                        .map(|(k, p, l, n, d)| (*k, *p, *l, n.as_str(), d.as_slice()))
+                                        .collect();
+                                        if !new_inserts.is_empty() {
+                                            match db.push(&new_inserts).await {
+                                                Ok(st) => {
+                                                    let new_funcs = st.iter().filter(|&&v| v == 1).count() as u64;
+                                                    let updated_funcs = st.iter().filter(|&&v| v == 0).count() as u64;
+                                                    METRICS.pushes.fetch_add((new_funcs + updated_funcs) as u64, std::sync::atomic::Ordering::Relaxed);
+                                                    METRICS.new_funcs.fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+                                                }
+                                                Err(e) => {
+                                                    error!("db push after upstream: {}", e);
+                                                }
+                                            }
+                                        }
+                                        METRICS.upstream_fetched.fetch_add(found_count, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        warn!("upstream pull failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut found_list = Vec::new();
+                    for it in maybe_funcs.into_iter() {
+                        if let Some(v) = it { found_list.push(v); }
+                    }
+
+                    METRICS.pulls.fetch_add(found_list.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    debug!("Lumina PULL response: {} found, {} not found", found_list.len(), statuses.iter().filter(|&&s| s == 1).count());
+                    lumina::send_lumina_pull_result(&mut stream, &statuses, &found_list).await?;
                 },
                 0x10 => { // PushMetadata
                     let caps = lumina::LuminaCaps {
@@ -333,7 +372,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     };
 
                     debug!("Lumina PUSH request: {} items", push_msg.funcs.len());
-                    
+
                     let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> = Vec::with_capacity(push_msg.funcs.len());
                     for func in &push_msg.funcs {
                         if func.hash.len() != 16 {
@@ -348,24 +387,21 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         ]);
                         inlined.push((key, 0, func.func_len, &func.name, &func.func_data));
                     }
-                    
+
                     match db.push(&inlined).await {
                         Ok(status) => {
-                            // status: 1 = new, 0 = updated, 2 = unchanged/skipped
                             let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
                             let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
                             let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
-                            
+
                             METRICS.pushes.fetch_add((new_funcs + updated_funcs) as u64, std::sync::atomic::Ordering::Relaxed);
                             METRICS.new_funcs.fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
-                            
+
                             debug!(
-                                "Lumina PUSH response: {} new, {} updated, {} unchanged", 
+                                "Lumina PUSH response: {} new, {} updated, {} unchanged",
                                 new_funcs, updated_funcs, skipped_funcs
                             );
-                            
-                            // Lumina client: 1 = new/success, 0 = not new/skipped
-                            // Map: 1 (new) → 1, 0 (updated) → 1, 2 (unchanged/skipped) → 0
+
                             let lumina_status: Vec<u32> = status.iter().map(|&s| if s == 2 { 0 } else { 1 }).collect();
                             lumina::send_lumina_push_result(&mut stream, &lumina_status).await?;
                         },
@@ -402,16 +438,16 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     };
 
                     debug!("Lumina HIST request: {} keys", hist_msg.funcs.len());
-                    
+
                     let limit = if cfg.lumina.get_history_limit == 0 { 0 } else { cfg.lumina.get_history_limit };
                     if limit == 0 {
                         lumina::send_lumina_fail(&mut stream, 4, &format!("{}: function histories are disabled on this server.", cfg.lumina.server_name)).await?;
                         continue;
                     }
-                    
+
                     let mut statuses = Vec::new();
                     let mut histories = Vec::new();
-                    
+
                     for func in &hist_msg.funcs {
                         if func.mb_hash.len() != 16 {
                             statuses.push(0);
@@ -423,7 +459,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             func.mb_hash[8], func.mb_hash[9], func.mb_hash[10], func.mb_hash[11],
                             func.mb_hash[12], func.mb_hash[13], func.mb_hash[14], func.mb_hash[15],
                         ]);
-                        
+
                         match db.get_history(key, limit).await {
                             Ok(hist) if !hist.is_empty() => {
                                 statuses.push(1);
@@ -440,7 +476,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             }
                         }
                     }
-                    
+
                     debug!("Lumina HIST response: {} histories found", histories.len());
                     lumina::send_lumina_histories_result(&mut stream, &statuses, &histories).await?;
                 },
@@ -453,7 +489,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             continue;
         }
 
-        // --- New protocol commands ---
         let msg_start = Instant::now();
 
         match typ {
@@ -466,18 +501,77 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 debug!("PULL request: {} keys", keys.len());
                 METRICS.queried_funcs.fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
-                let mut statuses = Vec::with_capacity(keys.len());
-                let mut found = Vec::new();
+                // Build per-index option and statuses, preserve order for 'found' packing.
+                let mut maybe_funcs: Vec<Option<(u32,u32,String,Vec<u8>)>> = vec![None; keys.len()];
+                let mut statuses: Vec<u32> = vec![1; keys.len()];
 
-                for k in keys {
+                for (i, k) in keys.iter().copied().enumerate() {
                     match db.get_latest(k).await {
                         Ok(Some(f)) => {
-                            statuses.push(0);
-                            found.push((f.popularity, f.len_bytes, f.name, f.data));
+                            statuses[i] = 0;
+                            maybe_funcs[i] = Some((f.popularity, f.len_bytes, f.name, f.data));
                         },
-                        Ok(None) => { statuses.push(1); },
-                        Err(e) => { error!("db pull: {}", e); statuses.push(1); }
+                        Ok(None) => { statuses[i] = 1; },
+                        Err(e) => { error!("db pull: {}", e); statuses[i] = 1; }
                     }
+                }
+
+                // Upstream fetch for misses
+                if let Some(ref up) = cfg.upstream {
+                    if up.enabled {
+                        let mut missing_keys = Vec::new();
+                        let mut missing_pos = Vec::new();
+                        for (i, (&k, st)) in keys.iter().zip(statuses.iter()).enumerate() {
+                            if *st == 1 {
+                                missing_keys.push(k);
+                                missing_pos.push(i);
+                            }
+                        }
+                        if !missing_keys.is_empty() {
+                            METRICS.upstream_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match crate::upstream::fetch_from_upstream(up.clone(), &missing_keys).await {
+                            Ok(fetched) => {
+                                let mut new_inserts_owned: Vec<(u128, u32, u32, String, Vec<u8>)> = Vec::new();
+                                let mut found_count = 0u64;
+                                for (j, item) in fetched.into_iter().enumerate() {
+                                    let idx = missing_pos[j];
+                                    if let Some((pop, len, name, data)) = item {
+                                        statuses[idx] = 0;
+                                        new_inserts_owned.push((missing_keys[j], pop, len, name.clone(), data.clone()));
+                                        maybe_funcs[idx] = Some((pop, len, name, data));
+                                        found_count += 1;
+                                    }
+                                }
+                                let new_inserts: Vec<(u128, u32, u32, &str, &[u8])> = new_inserts_owned.iter()
+                                    .map(|(k, p, l, n, d)| (*k, *p, *l, n.as_str(), d.as_slice()))
+                                    .collect();
+                                if !new_inserts_owned.is_empty() {
+                                        match db.push(&new_inserts).await {
+                                            Ok(st) => {
+                                                let new_funcs = st.iter().filter(|&&v| v == 1).count() as u64;
+                                                let updated_funcs = st.iter().filter(|&&v| v == 0).count() as u64;
+                                                METRICS.pushes.fetch_add((new_funcs + updated_funcs) as u64, std::sync::atomic::Ordering::Relaxed);
+                                                METRICS.new_funcs.fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+                                            }
+                                            Err(e) => {
+                                                error!("db push after upstream: {}", e);
+                                            }
+                                        }
+                                    }
+                                    METRICS.upstream_fetched.fetch_add(found_count, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    warn!("upstream pull failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut found = Vec::new();
+                for it in maybe_funcs.into_iter() {
+                    if let Some(v) = it { found.push(v); }
                 }
 
                 METRICS.pulls.fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -500,7 +594,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
                 if log_enabled!(log::Level::Debug) {
                     for (i, item) in items.iter().enumerate().take(5) {
-                        debug!("  Item[{}]: key=0x{:032x}, pop={}, len={}, name='{}'", 
+                        debug!("  Item[{}]: key=0x{:032x}, pop={}, len={}, name='{}'",
                                i, item.key, item.popularity, item.len_bytes, item.name);
                         debug!("    Data hex dump:\n{}", hex_dump(&item.data, 128));
                     }
@@ -518,7 +612,6 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
                 match res {
                     Ok(status) => {
-                        // status: 1 = new, 0 = updated, 2 = unchanged/skipped
                         let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
                         let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
                         let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
@@ -547,9 +640,9 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 debug!("DEL request: {} keys", keys.len());
 
                 match db.delete_keys(&keys).await {
-                    Ok(n) => { 
+                    Ok(n) => {
                         debug!("DEL response: {} keys deleted (took {:?})", n, msg_start.elapsed());
-                        write_all(&mut stream, &encode_del_ok(n)).await?; 
+                        write_all(&mut stream, &encode_del_ok(n)).await?;
                     },
                     Err(e) => {
                         error!("db del: {}", e);
@@ -601,25 +694,20 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     }
 }
 
-/// Return true iff the peeked bytes look like a TLS ClientHello record.
-/// Heuristics (conservative to minimize false positives):
-///   - TLS record header: [ContentType=0x16][Major=0x03][Minor in 0x00..=0x04][len_hi][len_lo]
-///   - First handshake byte after record header: 0x01 (ClientHello)
 #[inline]
 fn looks_like_tls_client_hello(hdr6: &[u8]) -> bool {
     if hdr6.len() < 6 { return false; }
-    if hdr6[0] != 0x16 { return false; }          // Handshake record
-    if hdr6[1] != 0x03 { return false; }          // SSLv3/TLS major
-    if hdr6[2] > 0x04 { return false; }           // <= TLS1.3 minor
+    if hdr6[0] != 0x16 { return false; }
+    if hdr6[1] != 0x03 { return false; }
+    if hdr6[2] > 0x04 { return false; }
     let len = u16::from_be_bytes([hdr6[3], hdr6[4]]) as usize;
-    if len == 0 || len > (16 * 1024) { return false; } // sane record length
-    hdr6[5] == 0x01                                // HandshakeType::ClientHello
+    if len == 0 || len > (16 * 1024) { return false; }
+    hdr6[5] == 0x01
 }
 
 pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
     let listener = TcpListener::bind(&cfg.lumina.bind_addr).await.expect("bind failed");
 
-    // construct global budget once per listener
     let global_budget = Arc::new(Budget::new(cfg.limits.global_inflight_bytes));
 
     let mut tls_acceptor = None;
@@ -628,12 +716,11 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
         let mut crt = std::fs::read(&tls.pkcs12_path).expect("read pkcs12 file");
         let pass = std::env::var(&tls.env_password_var).unwrap_or_default();
         let id = native_tls::Identity::from_pkcs12(&crt, &pass).expect("parse pkcs12");
-        crt.iter_mut().for_each(|b| *b = 0); // zeroize
+        crt.iter_mut().for_each(|b| *b = 0);
 
         let mut builder = native_tls::TlsAcceptor::builder(id);
 
         if tls.min_protocol_sslv3 {
-            // *** Retained per request (IDA Pro requirement) ***
             builder.min_protocol_version(Some(native_tls::Protocol::Sslv3));
         }
 
@@ -666,10 +753,8 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
             debug!("New connection from {}", addr);
 
             let res = if let Some(acc) = acceptor {
-                // TLS is enabled in config: sniff first bytes and choose TLS vs cleartext.
                 let sniff_deadline = Duration::from_millis(cfg.limits.tls_handshake_timeout_ms);
                 let is_tls = match tokio::time::timeout(sniff_deadline, async {
-                    // Wait until there is data to peek or the timeout elapses.
                     socket.readable().await.ok();
                     let mut hdr = [0u8; 6];
                     match socket.peek(&mut hdr).await {
@@ -679,7 +764,7 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
                     }
                 }).await {
                     Ok(v) => v,
-                    Err(_) => false, // sniff timed out: treat as cleartext to let normal timeouts apply
+                    Err(_) => false,
                 };
 
                 if is_tls {
@@ -697,12 +782,11 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
                     handle_client(socket, cfg, db, global_budget).await
                 }
             } else {
-                // TLS disabled in config → cleartext only.
                 handle_client(socket, cfg, db, global_budget).await
             };
 
-            if let Err(e) = res { 
-                debug!("connection {} ended: {}", addr, e); 
+            if let Err(e) = res {
+                debug!("connection {} ended: {}", addr, e);
             } else {
                 debug!("connection {} closed cleanly", addr);
             }
@@ -717,10 +801,8 @@ mod sniff_tests {
     use super::looks_like_tls_client_hello;
     #[test]
     fn tls_header_positive_and_negative() {
-        // 16 03 03 00 2a 01 : Handshake, TLS1.2, len=42, ClientHello
         let good = [0x16, 0x03, 0x03, 0x00, 0x2a, 0x01];
         assert!(looks_like_tls_client_hello(&good));
-        // Our cleartext frame example: [len=5 be] [type=0x01]
         let clear = [0x00, 0x00, 0x00, 0x05, 0x01, 0xff];
         assert!(!looks_like_tls_client_hello(&clear));
     }

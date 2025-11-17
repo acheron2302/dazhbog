@@ -11,6 +11,7 @@ mod http;
 mod metrics;
 mod util;
 mod lumina;
+mod upstream;
 
 use crate::server::serve_binary_rpc;
 use crate::http::serve_http;
@@ -27,21 +28,112 @@ fn setup_logger() {
     pretty_env_logger::init_timed();
 }
 
+fn print_help() {
+    println!("dazhbog v{}", env!("CARGO_PKG_VERSION"));
+    println!("A high-performance, embedded-storage Lumina server compatible with IDA Pro 7.2+\n");
+    println!("USAGE:");
+    println!("    dazhbog [OPTIONS] [CONFIG_FILE]\n");
+    println!("OPTIONS:");
+    println!("    -h, --help       Show this help message\n");
+    println!("ARGUMENTS:");
+    println!("    [CONFIG_FILE]    Path to configuration file (default: config.toml)\n");
+    println!("CONFIGURATION:");
+    println!("The configuration file uses a simple key=value format with sections.\n");
+    println!("[limits] - Connection and resource limits");
+    println!("  hello_timeout_ms = 3000                    # Timeout for initial handshake (ms)");
+    println!("  command_timeout_ms = 15000                 # Timeout for commands (ms)");
+    println!("  tls_handshake_timeout_ms = 5000            # TLS handshake timeout (ms)");
+    println!("  pull_timeout_ms = 15000                    # PULL operation timeout (ms)");
+    println!("  push_timeout_ms = 15000                    # PUSH operation timeout (ms)");
+    println!("  max_active_conns = 2048                    # Maximum concurrent connections");
+    println!("  max_hello_frame_bytes = 16777216           # Max size of hello frame (16MB)");
+    println!("  max_cmd_frame_bytes = 268435456            # Max size of command frame (256MB)");
+    println!("  max_pull_items = 524288                    # Max items in PULL request");
+    println!("  max_push_items = 524288                    # Max items in PUSH request");
+    println!("  max_del_items = 524288                     # Max items in DELETE request");
+    println!("  max_hist_items = 4096                      # Max items in history request");
+    println!("  max_name_bytes = 65535                     # Max length of name field");
+    println!("  max_data_bytes = 8388608                   # Max size of data field (8MB)");
+    println!("  per_connection_inflight_bytes = 33554432   # Per-connection memory limit (32MB)");
+    println!("  global_inflight_bytes = 536870912          # Global memory limit (512MB)");
+    println!("  lumina_max_cstr_bytes = 4096               # Max C-string length in Lumina protocol");
+    println!("  lumina_max_hash_bytes = 64                 # Max hash length\n");
+    println!("[engine] - Storage engine configuration");
+    println!("  data_dir = \"data\"                          # Data directory path");
+    println!("  segment_bytes = 1073741824                 # Segment file size (1GB)");
+    println!("  shard_count = 64                           # Number of shards");
+    println!("  index_capacity = 1073741824                # Index capacity (1GB)");
+    println!("  sync_interval_ms = 200                     # Sync to disk interval (ms)");
+    println!("  compaction_check_ms = 30000                # Compaction check interval (ms)");
+    println!("  use_mmap_reads = false                     # Use memory-mapped file reads");
+    println!("  deduplicate_on_startup = false             # Remove duplicates on startup (rewrites segments)");
+    println!("  index_dir = \"\"                             # Optional separate index directory");
+    println!("  index_memtable_max_entries = 200000        # Max entries in index memtable");
+    println!("  index_block_entries = 128                  # Entries per index block");
+    println!("  index_level0_compact_trigger = 8           # Trigger for level 0 compaction\n");
+    println!("[lumina] - Lumina protocol server configuration");
+    println!("  bind_addr = \"0.0.0.0:20667\"                # Lumina server bind address");
+    println!("  server_name = \"dazhbog\"                    # Server identifier");
+    println!("  allow_deletes = false                      # Allow DELETE operations");
+    println!("  get_history_limit = 0                      # History query limit (0 = disabled)");
+    println!("  use_tls = false                            # Enable TLS\n");
+    println!("[tls] - TLS configuration (when lumina.use_tls = true)");
+    println!("  pkcs12_path = \"\"                           # Path to PKCS12 certificate file");
+    println!("  env_password_var = \"PKCSPASSWD\"            # Environment variable for PKCS12 password");
+    println!("  min_protocol_sslv3 = true                  # Allow SSLv3 as minimum protocol\n");
+    println!("[http] - HTTP API server configuration");
+    println!("  bind_addr = \"127.0.0.1:8080\"               # HTTP server bind address\n");
+    println!("[upstream] - Optional upstream server configuration");
+    println!("  enabled = false                            # Enable upstream forwarding");
+    println!("  host = \"\"                                  # Upstream server hostname");
+    println!("  port = 0                                   # Upstream server port");
+    println!("  use_tls = true                             # Use TLS for upstream connection");
+    println!("  insecure_no_verify = true                  # Skip TLS certificate verification");
+    println!("  hello_protocol_version = 6                 # Protocol version for handshake");
+    println!("  license = \"\"                               # Optional license string");
+    println!("  timeout_ms = 8000                          # Upstream request timeout (ms)");
+    println!("  batch_max = 1024                           # Max items per upstream batch\n");
+    println!("EXAMPLES:");
+    println!("    dazhbog                                   # Use default config.toml");
+    println!("    dazhbog myconfig.toml                     # Use custom config file");
+    println!("    dazhbog --help                            # Show this help");
+}
+
 #[tokio::main]
 async fn main() {
-    setup_logger();
-
-    // CLI
     let mut args = std::env::args().skip(1);
-    let cfg_path = args.next().unwrap_or_else(|| "config.toml".to_string());
-    let cfg = Config::load(&cfg_path).unwrap_or_else(|e| {
-        eprintln!("failed to read config {}: {}", cfg_path, e);
-        std::process::exit(1);
-    });
-    let cfg = Arc::new(cfg);
-    info!("config loaded from {}", cfg_path);
+    
+    // Check for help flag
+    if let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            print_help();
+            return;
+        }
+        // Use provided config path
+        setup_logger();
+        let cfg = Config::load(&arg).unwrap_or_else(|e| {
+            eprintln!("failed to read config {}: {}", arg, e);
+            std::process::exit(1);
+        });
+        let cfg = Arc::new(cfg);
+        info!("config loaded from {}", arg);
 
-    // Storage engine
+        run_server(cfg).await;
+    } else {
+        // Use default config.toml
+        setup_logger();
+        let cfg = Config::load("config.toml").unwrap_or_else(|e| {
+            eprintln!("failed to read config config.toml: {}", e);
+            std::process::exit(1);
+        });
+        let cfg = Arc::new(cfg);
+        info!("config loaded from config.toml");
+
+        run_server(cfg).await;
+    }
+}
+
+async fn run_server(cfg: Arc<Config>) {
     let db = db::Database::open(cfg.clone())
         .await
         .unwrap_or_else(|e| {
@@ -49,7 +141,6 @@ async fn main() {
             std::process::exit(1);
         });
 
-    // HTTP server (metrics + home + /api stub room)
     let http_task = {
         let cfg = cfg.clone();
         let db = db.clone();
@@ -58,7 +149,6 @@ async fn main() {
         })
     };
 
-    // Binary RPC server (TCP/TLS)
     let rpc_task = {
         let cfg = cfg.clone();
         let db = db.clone();

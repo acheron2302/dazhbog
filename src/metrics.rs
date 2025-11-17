@@ -12,12 +12,13 @@ pub struct Metrics {
     pub errors: AtomicU64,
     pub timeouts: AtomicU64,
     pub shutting_down: AtomicBool,
-    // Index overflow guard trips
     pub index_overflows: AtomicU64,
-    // Database operation failures
     pub append_failures: AtomicU64,
-    // Decoder rejections due to size limits
     pub decoder_rejects: AtomicU64,
+    // Upstream metrics
+    pub upstream_requests: AtomicU64,
+    pub upstream_fetched: AtomicU64,
+    pub upstream_errors: AtomicU64,
 }
 
 pub static METRICS: once_cell::sync::Lazy<&'static Metrics> = once_cell::sync::Lazy::new(|| {
@@ -42,6 +43,9 @@ impl Metrics {
         s.push_str(&g("dazhbog_index_overflows_total","Index insertion overflows (no overwrite)", self.index_overflows.load(Ordering::Relaxed)));
         s.push_str(&g("dazhbog_append_failures_total","Database append operation failures", self.append_failures.load(Ordering::Relaxed)));
         s.push_str(&g("dazhbog_decoder_rejects_total","Protocol decoder rejections due to size limits", self.decoder_rejects.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_upstream_requests_total","Batches requested from upstream", self.upstream_requests.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_upstream_fetched_total","Functions fetched from upstream", self.upstream_fetched.load(Ordering::Relaxed)));
+        s.push_str(&g("dazhbog_upstream_errors_total","Errors contacting upstream", self.upstream_errors.load(Ordering::Relaxed)));
         s
     }
 }

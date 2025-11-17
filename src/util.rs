@@ -14,7 +14,6 @@ pub const fn addr_off(addr: u64) -> u64 { (addr >> 8) & ((1u64<<40)-1) }
 
 #[inline]
 pub fn wyhash64(mut x: u64) -> u64 {
-    // Small, fast 64-bit mixer
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
     x ^= x >> 33;
@@ -32,29 +31,26 @@ pub fn key_tag(key: u128) -> u64 {
 pub fn hex_dump(data: &[u8], max_bytes: usize) -> String {
     let limit = data.len().min(max_bytes);
     let mut result = String::new();
-    
+
     for (i, chunk) in data[..limit].chunks(16).enumerate() {
         result.push_str(&format!("{:04x}: ", i * 16));
-        
-        // Hex bytes
+
         for (j, byte) in chunk.iter().enumerate() {
             if j == 8 {
-                result.push(' '); // Extra space in the middle
+                result.push(' ');
             }
             result.push_str(&format!("{:02x} ", byte));
         }
-        
-        // Pad remaining space if chunk < 16 bytes
+
         for j in chunk.len()..16 {
             if j == 8 {
                 result.push(' ');
             }
             result.push_str("   ");
         }
-        
+
         result.push_str(" |");
-        
-        // ASCII representation
+
         for byte in chunk {
             if byte.is_ascii_graphic() || *byte == b' ' {
                 result.push(*byte as char);
@@ -62,13 +58,13 @@ pub fn hex_dump(data: &[u8], max_bytes: usize) -> String {
                 result.push('.');
             }
         }
-        
+
         result.push_str("|\n");
     }
-    
+
     if data.len() > max_bytes {
         result.push_str(&format!("... ({} more bytes)\n", data.len() - max_bytes));
     }
-    
+
     result
 }

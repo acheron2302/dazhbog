@@ -22,7 +22,6 @@ pub fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
     crc = !crc;
     for &b in data {
         let idx = (crc ^ (b as u32)) & 0xFF;
-        // SAFETY: table initialized once, idx always < 256
         let t = unsafe { TABLE[idx as usize] };
         crc = (crc >> 8) ^ t;
     }

@@ -2,7 +2,6 @@ use bytes::{BytesMut, BufMut};
 use tokio::io::AsyncWriteExt;
 use crate::codec::*;
 
-// Message codes (unchanged)
 pub const MSG_HELLO: u8 = 0x01;
 pub const MSG_HELLO_OK: u8 = 0x02;
 pub const MSG_FAIL: u8 = 0x03;
@@ -63,8 +62,6 @@ pub fn encode_pull_ok(status: &[u32], funcs: &[(u32,u32,String,Vec<u8>)]) -> Byt
     frame(MSG_PULL_OK, &p)
 }
 
-// --- Explicit caps to avoid pre-allocation explosions ---
-
 pub fn decode_pull(payload: &[u8], max_items: usize) -> Result<Vec<u128>, CodecError> {
     let mut p = payload;
     if p.len() < 4 { return Err(CodecError::Short); }
@@ -106,7 +103,6 @@ pub fn decode_push(payload: &[u8], caps: &PushCaps) -> Result<Vec<PushItem>, Cod
         let popularity = u32::from_le_bytes(p[0..4].try_into().unwrap());
         let len_bytes_declared = u32::from_le_bytes(p[4..8].try_into().unwrap());
         p = &p[8..];
-        // bounded string/bytes
         let name = match get_str_max(&mut p, caps.max_name_bytes) {
             Ok(s) => s,
             Err(CodecError::Malformed("string too large")) => {
@@ -123,7 +119,6 @@ pub fn decode_push(payload: &[u8], caps: &PushCaps) -> Result<Vec<PushItem>, Cod
             }
             Err(e) => return Err(e),
         };
-        // len_bytes will be rigorously revalidated/normalized by DB & segment write path
         v.push(PushItem { key, popularity, len_bytes: len_bytes_declared, name, data });
     }
     Ok(v)

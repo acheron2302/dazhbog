@@ -40,10 +40,8 @@ impl Database {
     }
 
     pub async fn push(&self, items: &[(u128, u32, u32, &str, &[u8])]) -> io::Result<Vec<u32>> {
-        // status: 1 if new unique key, 0 if update (changed metadata), 2 if unchanged (skipped)
         let mut status = Vec::with_capacity(items.len());
         for (key, pop, _len_bytes_decl, name, data) in items.iter() {
-            // Enforce invariants at ingestion; avoid any possibility of on-disk mismatch
             if name.len() > u16::MAX as usize {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "name too long (> u16::MAX)"));
             }
@@ -52,8 +50,7 @@ impl Database {
             }
 
             let old = self.rt.index.get(*key);
-            
-            // Check if metadata has actually changed
+
             if old != 0 {
                 let seg_id = crate::util::addr_seg(old);
                 let off = crate::util::addr_off(old);
@@ -61,30 +58,27 @@ impl Database {
                     Some(reader) => {
                         match reader.read_at(off) {
                             Ok(existing) => {
-                                // Skip if name and data are identical (ignoring popularity/timestamp)
                                 if existing.name == *name && existing.data == *data {
-                                    status.push(2); // unchanged/skipped
+                                    status.push(2);
                                     continue;
                                 }
                             },
                             Err(e) => {
                                 log::warn!("Failed to read existing record at seg={}, off={}: {}", seg_id, off, e);
-                                // Proceed with update on read error
                             }
                         }
                     },
                     None => {
                         log::warn!("Segment {} not found for existing record", seg_id);
-                        // Proceed with update if segment missing
                     }
                 }
             }
-            
+
             let rec = Record {
                 key: *key,
                 ts_sec: crate::util::now_ts_sec(),
                 prev_addr: old,
-                len_bytes: (*data).len() as u32, // authoritative: actual data length
+                len_bytes: (*data).len() as u32,
                 popularity: *pop,
                 name: name.to_string(),
                 data: data.to_vec(),
@@ -119,10 +113,9 @@ impl Database {
                 popularity: 0,
                 name: String::new(),
                 data: Vec::new(),
-                flags: 0x01, // tombstone
+                flags: 0x01,
             };
             let addr = self.rt.segments.append(&rec)?;
-            // For tombstones, we still write to disk even if index is full
             let _ = self.rt.index.upsert(key, addr);
             if old != 0 { deleted += 1; }
         }
@@ -136,7 +129,7 @@ impl Database {
         while addr != 0 && limit > 0 {
             let r = self.rt.segments.get_reader(addr_seg(addr)).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "seg"))?;
             let rec = r.read_at(addr_off(addr))?;
-            if rec.flags & 0x01 == 0 { // skip tombstones
+            if rec.flags & 0x01 == 0 {
                 out.push((rec.ts_sec, rec.name, rec.data));
                 limit -= 1;
             }

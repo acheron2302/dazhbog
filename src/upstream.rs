@@ -1,0 +1,262 @@
+use crate::config::Upstream;
+use crate::lumina;
+use crate::metrics::METRICS;
+use log::*;
+use tokio::net::TcpStream;
+use tokio_native_tls::TlsConnector;
+use std::io;
+
+/// Result element for each requested key: Some(pop,len,name,data) when found
+pub type UpItem = Option<(u32,u32,String,Vec<u8>)>;
+
+/// Connect to upstream server (plain TCP or TLS with optional insecure verification)
+async fn connect(up: &Upstream) -> io::Result<UpstreamConn> {
+    let addr = format!("{}:{}", up.host, up.port);
+    debug!("upstream: connecting to {}", addr);
+    let stream = tokio::time::timeout(std::time::Duration::from_millis(up.timeout_ms), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+    debug!("upstream: TCP connection established");
+
+    if up.use_tls {
+        debug!("upstream: initiating TLS handshake (insecure_no_verify={})", up.insecure_no_verify);
+        let mut builder = native_tls::TlsConnector::builder();
+        if up.insecure_no_verify {
+            builder.danger_accept_invalid_certs(true);
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        let connector = builder.build().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls build: {e}")))?;
+        let connector = TlsConnector::from(connector);
+        let domain = up.host.as_str();
+        let tls = tokio::time::timeout(std::time::Duration::from_millis(up.timeout_ms), connector.connect(domain, stream))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout"))?
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls handshake: {e}")))?;
+        debug!("upstream: TLS handshake complete");
+        Ok(UpstreamConn::Tls(tls))
+    } else {
+        Ok(UpstreamConn::Plain(stream))
+    }
+}
+
+enum UpstreamConn {
+    Plain(TcpStream),
+    Tls(tokio_native_tls::TlsStream<TcpStream>),
+}
+
+impl UpstreamConn {
+    async fn write(&mut self, typ: u8, payload: &[u8]) -> io::Result<()> {
+        match self {
+            UpstreamConn::Plain(s) => lumina::write_lumina_packet(s, typ, payload).await,
+            UpstreamConn::Tls(s) => lumina::write_lumina_packet(s, typ, payload).await,
+        }
+    }
+    async fn read(&mut self, max_len: usize) -> io::Result<(u8, Vec<u8>)> {
+        match self {
+            UpstreamConn::Plain(s) => lumina::read_lumina_packet(s, max_len).await,
+            UpstreamConn::Tls(s) => lumina::read_lumina_packet(s, max_len).await,
+        }
+    }
+}
+
+/// Parse license ID from JSON (format: "XX-YYYY-ZZZZ-WW" -> [0xXX, 0xYY, 0xYY, 0xZZ, 0xZZ, 0xWW])
+fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
+    let json_str = std::str::from_utf8(json_data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("license not UTF-8: {}", e)))?;
+    
+    // Find "id" field in licenses array (first occurrence after "licenses")
+    if let Some(licenses_pos) = json_str.find(r#""licenses""#) {
+        let search_from = &json_str[licenses_pos..];
+        // Look for "id" field with optional whitespace: "id": "..."
+        for line in search_from.lines() {
+            if line.contains(r#""id""#) {
+                // Extract value after "id": 
+                if let Some(colon_pos) = line.find(':') {
+                    let after_colon = &line[colon_pos+1..].trim_start();
+                    if after_colon.starts_with('"') {
+                        if let Some(end_quote) = after_colon[1..].find('"') {
+                            let id_str = &after_colon[1..1+end_quote];
+                            // Parse format like "96-4406-9EB7-5F"
+                            let hex_only: String = id_str.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+                            if hex_only.len() == 12 {
+                                let mut lic_id = [0u8; 6];
+                                for i in 0..6 {
+                                    let hex_byte = &hex_only[i*2..i*2+2];
+                                    lic_id[i] = u8::from_str_radix(hex_byte, 16)
+                                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad hex in license ID: {}", e)))?;
+                                }
+                                debug!("upstream: parsed license ID from '{}': {:02X?}", id_str, lic_id);
+                                return Ok(lic_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(io::Error::new(io::ErrorKind::InvalidData, "could not find license ID in JSON"))
+}
+
+/// Perform a Lumina hello to upstream.
+/// License is sent as license_data; lic_number is parsed from JSON.
+async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Result<()> {
+    let lic_bytes: Vec<u8> = if let Some(ref path) = up.license_path {
+        std::fs::read(path).map_err(|e| {
+            io::Error::new(e.kind(), format!("failed to read license file '{}': {}", path, e))
+        })?
+    } else {
+        Vec::new()
+    };
+    
+    let lic_id = if !lic_bytes.is_empty() {
+        parse_license_id(&lic_bytes)?
+    } else {
+        [0u8; 6]
+    };
+    
+    let payload = lumina::build_lumina_hello_payload(
+        up.hello_protocol_version,
+        &lic_bytes,
+        lic_id,
+        "guest",
+        "",
+        0
+    );
+    debug!("upstream: sending hello (protocol_version={}, license_len={})", up.hello_protocol_version, lic_bytes.len());
+    conn.write(0x0d, &payload).await?;
+    debug!("upstream: waiting for hello response");
+    let (typ, pl) = conn.read(1 << 20).await?; // accept up to 1 MiB hello reply
+    debug!("upstream: received hello response type=0x{:02x}, len={}", typ, pl.len());
+    
+    // Check for failure response
+    if typ == 0x0b {
+        match lumina::decode_lumina_fail(&pl) {
+            Ok((code, msg)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("upstream rejected hello: code={}, message={}", code, msg)
+                ));
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("upstream rejected hello with type 0x0b (failed to decode message)")
+                ));
+            }
+        }
+    }
+    
+    // Expected success response is 0x31
+    if typ != 0x31 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("upstream hello: unexpected response type 0x{:02x}", typ)
+        ));
+    }
+    
+    Ok(())
+}
+
+/// Fetch missing items from upstream. Returns vector aligned to `keys`.
+pub async fn fetch_from_upstream(up: Upstream, keys: &[u128]) -> io::Result<Vec<UpItem>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    debug!("upstream: fetch_from_upstream called for {} keys (upstream={}:{}, use_tls={}, batch_max={})", 
+           keys.len(), up.host, up.port, up.use_tls, up.batch_max);
+    METRICS.upstream_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    
+    let batch = up.batch_max.max(1);
+    let mut results: Vec<UpItem> = vec![None; keys.len()];
+
+    let mut start = 0usize;
+    while start < keys.len() {
+        let end = (start + batch).min(keys.len());
+        let slice = &keys[start..end];
+
+        // Build hashes array (big-endian)
+        let mut arr = Vec::<[u8;16]>::with_capacity(slice.len());
+        for &k in slice {
+            arr.push(k.to_be_bytes());
+        }
+        let pull_payload = lumina::build_pull_metadata_payload(&arr);
+
+        // Connect and handshake per batch to simplify code and resource usage
+        let mut conn = match connect(&up).await {
+            Ok(c) => c,
+            Err(e) => {
+                METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("upstream connect failed: {}", e);
+                // keep None for these entries; try next batch
+                start = end;
+                continue;
+            }
+        };
+        if let Err(e) = upstream_handshake(&mut conn, &up).await {
+            METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("upstream handshake failed: {}", e);
+            start = end;
+            continue;
+        }
+
+        // Send PullMetadata (0x0e)
+        debug!("upstream: sending PullMetadata for {} keys (payload {} bytes)", slice.len(), pull_payload.len());
+        if let Err(e) = conn.write(0x0e, &pull_payload).await {
+            METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("upstream write pull failed: {}", e);
+            start = end;
+            continue;
+        }
+
+        // Read PullResult (0x0f)
+        debug!("upstream: waiting for PullResult response");
+        let (typ, payload) = match conn.read(64 * 1024 * 1024).await {
+            Ok(v) => {
+                debug!("upstream: received response type=0x{:02x}, payload {} bytes", v.0, v.1.len());
+                v
+            }
+            Err(e) => {
+                METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("upstream read pull failed: {} (io kind: {:?})", e, e.kind());
+                start = end;
+                continue;
+            }
+        };
+        if typ != 0x0f {
+            METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("upstream unexpected msg type: 0x{:02x}", typ);
+            start = end;
+            continue;
+        }
+
+        match lumina::decode_lumina_pull_result(&payload) {
+            Ok((statuses, funcs)) => {
+                debug!("upstream: decoded pull result: {} statuses, {} funcs", statuses.len(), funcs.len());
+                // Map funcs back to request order: functions correspond to statuses==0 in order
+                let mut fidx = 0usize;
+                let mut found_count = 0;
+                for i in 0..statuses.len().min(slice.len()) {
+                    if statuses[i] == 0 {
+                        if let Some((pop, len, name, data)) = funcs.get(fidx).cloned() {
+                            results[start + i] = Some((pop, len, name, data));
+                            found_count += 1;
+                        }
+                        fidx = fidx.saturating_add(1);
+                    }
+                }
+                debug!("upstream: mapped {} functions to results", found_count);
+                METRICS.upstream_fetched.fetch_add(found_count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                METRICS.upstream_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("upstream decode pull result failed: {:?}", e);
+            }
+        }
+
+        start = end;
+    }
+
+    Ok(results)
+}

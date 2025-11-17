@@ -1,4 +1,4 @@
-    mod crc32c;
+mod crc32c;
 mod segment;
 mod index;
 mod spin;
@@ -25,7 +25,6 @@ impl EngineRuntime {
         let dir = PathBuf::from(&cfg.data_dir);
         let segments = Arc::new(OpenSegments::open(&dir, cfg.segment_bytes, cfg.use_mmap_reads)?);
 
-        // Build index options from config and open disk-backed index under data_dir/index
         let index_dir = if let Some(ref override_dir) = cfg.index_dir {
             PathBuf::from(override_dir)
         } else {
@@ -39,7 +38,6 @@ impl EngineRuntime {
         };
         let index = Arc::new(ShardedIndex::open(&index_dir, idx_opts)?);
 
-        // Recovery: scan segments and rebuild index **only if the index is empty**.
         if index.entry_count() == 0 {
             segments.rebuild_index(&index)?;
         }

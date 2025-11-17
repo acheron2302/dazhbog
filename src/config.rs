@@ -8,35 +8,30 @@ pub struct Limits {
     pub pull_timeout_ms: u64,
     pub push_timeout_ms: u64,
     pub max_active_conns: usize,
-    // --- Per-frame hard caps ---
-    pub max_hello_frame_bytes: usize, // e.g., 4 MiB
-    pub max_cmd_frame_bytes: usize,   // e.g., 16 MiB
-    // --- Item-count & per-item caps (defend allocations before they happen) ---
+    pub max_hello_frame_bytes: usize,
+    pub max_cmd_frame_bytes: usize,
     pub max_pull_items: usize,
     pub max_push_items: usize,
     pub max_del_items: usize,
     pub max_hist_items: usize,
-    // Per-item bytes caps
-    pub max_name_bytes: usize, // must be <= u16::MAX due to on-disk format
-    pub max_data_bytes: usize, // per function metadata payload
-    // --- In-flight memory budgets ---
-    pub per_connection_inflight_bytes: usize, // soft limit per connection for frame buffers
-    pub global_inflight_bytes: usize,         // node-wide limit for all connections
-    // --- Lumina parser safety caps ---
-    pub lumina_max_cstr_bytes: usize, // cap for C-strings in lumina messages (paths, hostnames)
-    pub lumina_max_hash_bytes: usize, // cap for variable-length "mb_hash" (should be small; 16 is expected)
+    pub max_name_bytes: usize,
+    pub max_data_bytes: usize,
+    pub per_connection_inflight_bytes: usize,
+    pub global_inflight_bytes: usize,
+    pub lumina_max_cstr_bytes: usize,
+    pub lumina_max_hash_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct TLS {
     pub pkcs12_path: String,
-    pub env_password_var: String, // default PKCSPASSWD
-    pub min_protocol_sslv3: bool, // for compatibility parity with source
+    pub env_password_var: String,
+    pub min_protocol_sslv3: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Http {
-    pub bind_addr: String, // "127.0.0.1:8080"
+    pub bind_addr: String,
 }
 
 #[derive(Clone, Debug)]
@@ -50,25 +45,35 @@ pub struct Engine {
     pub use_mmap_reads: bool,
     pub deduplicate_on_startup: bool,
 
-    // ----------------- Disk index configuration (new) -----------------
-    /// Optional override directory for the disk index (defaults to data_dir/index).
     pub index_dir: Option<String>,
-    /// Maximum entries to keep in the in-memory memtable before flushing to an SSTable.
     pub index_memtable_max_entries: usize,
-    /// Target number of entries per SSTable block (fence pointer granularity).
     pub index_block_entries: usize,
-    /// Trigger a full compaction when level-0 file count exceeds this threshold.
     pub index_level0_compact_trigger: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Lumina {
-    pub bind_addr: String, // "0.0.0.0:20667"
+    pub bind_addr: String,
     pub server_name: String,
     pub allow_deletes: bool,
-    pub get_history_limit: u32, // 0 disables
+    pub get_history_limit: u32,
     pub use_tls: bool,
     pub tls: Option<TLS>,
+}
+
+// ---------------- Upstream configuration (optional) ----------------
+
+#[derive(Clone, Debug)]
+pub struct Upstream {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub use_tls: bool,
+    pub insecure_no_verify: bool,
+    pub hello_protocol_version: u32,
+    pub license_path: Option<String>,
+    pub timeout_ms: u64,
+    pub batch_max: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +82,7 @@ pub struct Config {
     pub http: Option<Http>,
     pub engine: Engine,
     pub lumina: Lumina,
+    pub upstream: Option<Upstream>,
 }
 
 impl Default for Config {
@@ -89,31 +95,29 @@ impl Default for Config {
                 pull_timeout_ms: 15000,
                 push_timeout_ms: 15000,
                 max_active_conns: 2048,
-                // Defaults (balanced for safety with compatibility):
-                max_hello_frame_bytes: 16 * 1024 * 1024,  // 16 MiB
-                max_cmd_frame_bytes: 256 * 1024 * 1024,   // 256 MiB
-                max_pull_items: 524288,  // 512k items
-                max_push_items: 524288,  // 512k items - handle very large binaries
-                max_del_items: 524288,   // 512k items
+                max_hello_frame_bytes: 16 * 1024 * 1024,
+                max_cmd_frame_bytes: 256 * 1024 * 1024,
+                max_pull_items: 524288,
+                max_push_items: 524288,
+                max_del_items: 524288,
                 max_hist_items: 4096,
-                max_name_bytes: 65535,       // u16::MAX; required by on-disk format
-                max_data_bytes: 8 * 1024 * 1024, // 8 MiB per item
-                per_connection_inflight_bytes: 32 * 1024 * 1024, // 32 MiB
-                global_inflight_bytes: 512 * 1024 * 1024,        // 512 MiB
-                lumina_max_cstr_bytes: 4096, // 4 KiB cap for C-strings (paths, hostnames)
-                lumina_max_hash_bytes: 64,   // hashes expected 16 bytes; allow small slack
+                max_name_bytes: 65535,
+                max_data_bytes: 8 * 1024 * 1024,
+                per_connection_inflight_bytes: 32 * 1024 * 1024,
+                global_inflight_bytes: 512 * 1024 * 1024,
+                lumina_max_cstr_bytes: 4096,
+                lumina_max_hash_bytes: 64,
             },
             http: Some(Http { bind_addr: "127.0.0.1:8080".into() }),
             engine: Engine {
                 data_dir: "data".into(),
-                segment_bytes: 1 << 30, // 1 GiB
+                segment_bytes: 1 << 30,
                 shard_count: 64,
-                index_capacity: 1 << 30, // legacy (unused by disk index)
+                index_capacity: 1 << 30,
                 sync_interval_ms: 200,
                 compaction_check_ms: 30000,
                 use_mmap_reads: false,
                 deduplicate_on_startup: false,
-                // Disk index defaults:
                 index_dir: None,
                 index_memtable_max_entries: 200_000,
                 index_block_entries: 128,
@@ -127,6 +131,7 @@ impl Default for Config {
                 use_tls: false,
                 tls: None,
             },
+            upstream: None,
         }
     }
 }
@@ -134,7 +139,6 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &str) -> io::Result<Self> {
         let s = fs::read_to_string(path)?;
-        // Minimal T0 "toml-like" parser to avoid deps.
         let mut cfg = Self::default();
         for (lineno, line) in s.lines().enumerate() {
             let line = line.trim();
@@ -152,6 +156,7 @@ impl Config {
                     (u) => { val.parse::<u64>().map_err(|e| e.to_string())? };
                     (usize_) => { val.parse::<usize>().map_err(|e| e.to_string())? };
                     (u32_) => { val.parse::<u32>().map_err(|e| e.to_string())? };
+                    (u16_) => { val.parse::<u16>().map_err(|e| e.to_string())? };
                 }
                 match (section, key) {
                     ("limits","hello_timeout_ms") => cfg.limits.hello_timeout_ms = parse!(u),
@@ -184,7 +189,6 @@ impl Config {
                     ("engine","use_mmap_reads") => cfg.engine.use_mmap_reads = parse!(b),
                     ("engine","deduplicate_on_startup") => cfg.engine.deduplicate_on_startup = parse!(b),
 
-                    // ---------------- Disk index params (new parsers) ----------------
                     ("engine","index_dir") => {
                         let v = parse!(s);
                         cfg.engine.index_dir = if v.is_empty() { None } else { Some(v) };
@@ -202,6 +206,74 @@ impl Config {
                     ("tls","pkcs12_path") => { cfg.lumina.tls.get_or_insert_with(|| super::config::TLS { pkcs12_path: "".into(), env_password_var: "PKCSPASSWD".into(), min_protocol_sslv3: true }).pkcs12_path = parse!(s); },
                     ("tls","env_password_var") => { cfg.lumina.tls.get_or_insert_with(|| super::config::TLS { pkcs12_path: "".into(), env_password_var: "PKCSPASSWD".into(), min_protocol_sslv3: true }).env_password_var = parse!(s); },
                     ("tls","min_protocol_sslv3") => { cfg.lumina.tls.get_or_insert_with(|| super::config::TLS { pkcs12_path: "".into(), env_password_var: "PKCSPASSWD".into(), min_protocol_sslv3: true }).min_protocol_sslv3 = parse!(b); },
+
+                    // ---------------- Upstream (optional) ----------------
+                    ("upstream","enabled") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).enabled = parse!(b);
+                    },
+                    ("upstream","host") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).host = parse!(s);
+                    },
+                    ("upstream","port") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).port = parse!(u16_);
+                    },
+                    ("upstream","use_tls") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).use_tls = parse!(b);
+                    },
+                    ("upstream","insecure_no_verify") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).insecure_no_verify = parse!(b);
+                    },
+                    ("upstream","hello_protocol_version") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).hello_protocol_version = parse!(u32_);
+                    },
+                    ("upstream","license_path") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).license_path = {
+                            let v = parse!(s);
+                            if v.is_empty() { None } else { Some(v) }
+                        };
+                    },
+                    ("upstream","timeout_ms") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).timeout_ms = parse!(u);
+                    },
+                    ("upstream","batch_max") => {
+                        cfg.upstream.get_or_insert_with(|| Upstream {
+                            enabled: false, host: String::new(), port: 0, use_tls: true,
+                            insecure_no_verify: true, hello_protocol_version: 6, license_path: None,
+                            timeout_ms: 8000, batch_max: 1024
+                        }).batch_max = parse!(usize_);
+                    },
 
                     _ => return Err(format!("unknown key {section}.{key}")),
                 }
