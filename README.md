@@ -239,59 +239,79 @@ Run `./dazhbog --help` for a complete list of configuration options.
 **Example `config.toml`:**
 
 ```toml
-# Connection and resource limits
-limits.hello_timeout_ms = 3000
-limits.command_timeout_ms = 15000
-limits.max_active_conns = 2048
-limits.max_pull_items = 524288
-limits.max_push_items = 524288
-limits.per_connection_inflight_bytes = 33554432  # 32 MB
-limits.global_inflight_bytes = 536870912         # 512 MB
+[limits]
+hello_timeout_ms = 3000
+command_timeout_ms = 15000
+tls_handshake_timeout_ms = 5000
+pull_timeout_ms = 15000
+push_timeout_ms = 15000
+max_active_conns = 2048
+max_hello_frame_bytes = 16777216
+max_cmd_frame_bytes = 268435456
+max_pull_items = 524288
+max_push_items = 524288
+max_del_items = 524288
+max_hist_items = 4096
+max_name_bytes = 65535
+max_data_bytes = 8388608
+per_connection_inflight_bytes = 33554432
+global_inflight_bytes = 536870912
+lumina_max_cstr_bytes = 4096
+lumina_max_hash_bytes = 64
 
-# Storage engine configuration
-engine.data_dir = "data"
-engine.segment_bytes = 1073741824  # 1 GB per segment
-engine.shard_count = 64
-engine.index_capacity = 1073741824
-engine.deduplicate_on_startup = false  # Set true to deduplicate on startup (slow)
-engine.index_memtable_max_entries = 200000
-engine.index_block_entries = 128
-engine.index_level0_compact_trigger = 8
+[http]
+bind_addr = "127.0.0.1:8080"
 
-# Context-aware scoring configuration
-scoring.w_md5 = 2.0              # Weight for binary MD5 match
-scoring.w_name = 1.0             # Weight for basename similarity
-scoring.w_coh = 2.0              # Weight for function co-occurrence
-scoring.w_stab = 0.5             # Weight for version stability
-scoring.w_rec = 0.5              # Weight for recency
-scoring.w_pop_bin = 0.5          # Weight for binary popularity
-scoring.w_host = 0.25            # Weight for hostname match (reserved)
-scoring.w_origin = 0.25          # Weight for origin match (reserved)
-scoring.max_versions_per_key = 16    # Max version history to consider per key
-scoring.max_md5_per_key = 16         # Max binaries tracked per key
-scoring.max_md5_per_version = 16     # Max binaries tracked per version
+[engine]
+data_dir = "data"
+segment_bytes = 1073741824
+shard_count = 64
+index_capacity = 1073741824
+sync_interval_ms = 200
+compaction_check_ms = 30000
+use_mmap_reads = false
+deduplicate_on_startup = false
+index_dir = "index"
+index_memtable_max_entries = 200000
+index_block_entries = 128
+index_level0_compact_trigger = 8
 
-# Lumina protocol server
-lumina.bind_addr = "0.0.0.0:1234"
-lumina.server_name = "dazhbog"
-lumina.allow_deletes = false
-lumina.get_history_limit = 32  # Max history versions to return (0 = disabled)
-lumina.use_tls = false
+[lumina]
+bind_addr = "0.0.0.0:1234"
+server_name = "dazhbog"
+allow_deletes = false
+get_history_limit = 32
+use_tls = false
 
-# Upstream forwarding (optional)
-upstream.0.enabled = true
-upstream.0.priority = 0
-upstream.0.host = "lumina.hex-rays.com"
-upstream.0.port = 443
-upstream.0.use_tls = true
-upstream.0.insecure_no_verify = true
-upstream.0.hello_protocol_version = 6
-upstream.0.license_path = "license.hexlic"
-upstream.0.timeout_ms = 8000
-upstream.0.batch_max = 131072
+[lumina.tls]
+pkcs12_path = "cert.p12"
+env_password_var = "PKCSPASSWD"
+min_protocol_sslv3 = true
 
-# HTTP metrics server
-http.bind_addr = "0.0.0.0:8080"
+[[upstreams]]
+enabled = true
+priority = 1
+host = "lumina.hex-rays.com"
+port = 443
+use_tls = true
+insecure_no_verify = true
+hello_protocol_version = 6
+license_path = "license.hexlic"
+timeout_ms = 8000
+batch_max = 131072
+
+[scoring]
+w_md5 = 2.0
+w_name = 1.0
+w_coh = 2.0
+w_stab = 0.5
+w_rec = 0.5
+w_pop_bin = 0.5
+w_host = 0.25
+w_origin = 0.25
+max_versions_per_key = 16
+max_md5_per_key = 16
+max_md5_per_version = 16
 ```
 
 ### IDA Pro Configuration

@@ -35,7 +35,7 @@ COPY config.toml ./
 COPY data ./data
 
 # Expose port
-EXPOSE 1234
+EXPOSE 1235
 
 # Run the binary
-CMD ["./dazhbog"]
+CMD ["./dazhbog", "./config.toml"]

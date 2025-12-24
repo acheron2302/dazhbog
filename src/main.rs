@@ -126,7 +126,7 @@ async fn main() {
     } else {
         // Use default config.toml
         setup_logger();
-        let cfg = Config::load("config.toml").unwrap_or_else(|e| {
+        let cfg = Config::load("./config.toml").unwrap_or_else(|e| {
             eprintln!("failed to read config config.toml: {}", e);
             std::process::exit(1);
         });
