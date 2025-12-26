@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use std::error::Error;
 use tokio::io::AsyncReadExt;
 use tokio::{net::TcpListener, time::timeout};
 
@@ -157,11 +158,14 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     .await
     {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(e),
+        Ok(Err(e)) => {
+            let err_msg = format!("Cannot handle hello frame: {}", e.to_string());
+            return Err(io::Error::new(io::ErrorKind::InvalidData, err_msg))
+        },
         Err(_) => {
             METRICS
                 .timeouts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
     };
@@ -264,31 +268,69 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    if hello.username != "guest" {
-        if is_lumina {
-            lumina::send_lumina_fail(
-                &mut stream,
-                1,
-                &format!(
-                    "{}: invalid username or password. Try logging in with `guest` instead.",
-                    cfg.lumina.server_name
-                ),
-            )
-            .await?;
-        } else {
-            write_all(
-                &mut stream,
-                &encode_fail(
+    // Check if credentials are configured
+    let auth_required = !cfg.lumina.credentials.is_empty();
+    
+    if auth_required {
+        // Check if provided credentials match any in the configured list
+        let credentials_valid = cfg.lumina.credentials.iter().any(|cred| {
+            cred.username == hello.username && cred.password == hello.password
+        });
+        
+        if !credentials_valid {
+            if is_lumina {
+                lumina::send_lumina_fail(
+                    &mut stream,
+                    1,
+                    &format!(
+                        "{}: invalid username or password.",
+                        cfg.lumina.server_name
+                    ),
+                )
+                .await?;
+            } else {
+                write_all(
+                    &mut stream,
+                    &encode_fail(
+                        1,
+                        &format!(
+                            "{}: invalid username or password.",
+                            cfg.lumina.server_name
+                        ),
+                    ),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+    } else {
+        // If no credentials are configured, only allow "guest" user
+        if hello.username != "guest" {
+            if is_lumina {
+                lumina::send_lumina_fail(
+                    &mut stream,
                     1,
                     &format!(
                         "{}: invalid username or password. Try logging in with `guest` instead.",
                         cfg.lumina.server_name
                     ),
-                ),
-            )
-            .await?;
+                )
+                .await?;
+            } else {
+                write_all(
+                    &mut stream,
+                    &encode_fail(
+                        1,
+                        &format!(
+                            "{}: invalid username or password. Try logging in with `guest` instead.",
+                            cfg.lumina.server_name
+                        ),
+                    ),
+                )
+                .await?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     if is_lumina {
@@ -556,7 +598,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                                                 let updated_funcs =
                                                     st.iter().filter(|&&v| v == 0).count() as u64;
                                                 METRICS.pushes.fetch_add(
-                                                    (new_funcs + updated_funcs) as u64,
+                                                    (new_funcs + updated_funcs),
                                                     std::sync::atomic::Ordering::Relaxed,
                                                 );
                                                 METRICS.new_funcs.fetch_add(
@@ -677,7 +719,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
 
                             METRICS.pushes.fetch_add(
-                                (new_funcs + updated_funcs) as u64,
+                                (new_funcs + updated_funcs),
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                             METRICS
@@ -795,7 +837,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                                 statuses.push(1);
                                 let hist_tuples: Vec<(u64, String, Vec<u8>)> = hist
                                     .into_iter()
-                                    .map(|(ts, name, data)| (ts as u64, name, data))
+                                    .map(|(ts, name, data)| (ts, name, data))
                                     .collect();
                                 histories.push(hist_tuples);
                             }
@@ -935,7 +977,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                                             let updated_funcs =
                                                 st.iter().filter(|&&v| v == 0).count() as u64;
                                             METRICS.pushes.fetch_add(
-                                                (new_funcs + updated_funcs) as u64,
+                                                (new_funcs + updated_funcs),
                                                 std::sync::atomic::Ordering::Relaxed,
                                             );
                                             METRICS.new_funcs.fetch_add(
@@ -1019,7 +1061,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
                         let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
                         METRICS.pushes.fetch_add(
-                            (new_funcs + updated_funcs) as u64,
+                            new_funcs + updated_funcs,
                             std::sync::atomic::Ordering::Relaxed,
                         );
                         METRICS
@@ -1283,7 +1325,7 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
 
             let res = if let Some(acc) = acceptor {
                 let sniff_deadline = Duration::from_millis(cfg.limits.tls_handshake_timeout_ms);
-                let is_tls = match tokio::time::timeout(sniff_deadline, async {
+                let is_tls = tokio::time::timeout(sniff_deadline, async {
                     socket.readable().await.ok();
                     let mut hdr = [0u8; 6];
                     match socket.peek(&mut hdr).await {
@@ -1291,12 +1333,7 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
                         Ok(_) => false,
                         Err(_) => false,
                     }
-                })
-                .await
-                {
-                    Ok(v) => v,
-                    Err(_) => false,
-                };
+                }).await.unwrap_or_else(|_| false);
 
                 if is_tls {
                     debug!("{}: sniffed TLS ClientHello; upgrading connection", addr);

@@ -95,6 +95,12 @@ pub struct Debug {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lumina {
     #[serde(default = "default_lumina_bind_addr")]
     pub bind_addr: String,
@@ -109,6 +115,9 @@ pub struct Lumina {
     
     #[serde(default)]
     pub tls: Option<TLS>,
+    
+    #[serde(default)]
+    pub credentials: Vec<Credentials>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -351,6 +360,7 @@ impl Default for Lumina {
             get_history_limit: default_get_history_limit(),
             use_tls: default_use_tls(),
             tls: None,
+            credentials: Vec::new(),
         }
     }
 }
@@ -458,6 +468,20 @@ server_name = "dazhbog"
 allow_deletes = false
 get_history_limit = 0
 use_tls = false
+
+# Configure multiple username/password pairs for authentication
+# If credentials are empty, only "guest" user is allowed
+[[lumina.credentials]]
+username = "user1"
+password = "password1"
+
+[[lumina.credentials]]
+username = "user2"
+password = "password2"
+
+[[lumina.credentials]]
+username = "admin"
+password = "secure_password"
 
 [lumina.tls]
 pkcs12_path = "cert.p12"
