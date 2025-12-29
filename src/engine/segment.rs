@@ -7,7 +7,7 @@ use std::{
 use std::os::windows::fs::FileExt;
 
 #[cfg(unix)]
-use std::os::linux::fs::FileExt;
+use std::os::unix::fs::FileExt;
 
 use crate::engine::crc32c::{crc32c, crc32c_legacy};
 use crate::util::pack_addr;
@@ -293,7 +293,7 @@ fn migrate_dat_files_to_sled(dat_files: &[PathBuf], db: &sled::Db, _dir: &Path) 
 
         while offset + 12 < file_len {
             let mut hdr = [0u8; 12];
-            #[cfg(target_os = "unix")]
+            #[cfg(target_os = "linux")]
             if file.read_exact_at(&mut hdr, offset).is_err() {
                 break;
             }
@@ -315,7 +315,7 @@ fn migrate_dat_files_to_sled(dat_files: &[PathBuf], db: &sled::Db, _dir: &Path) 
             }
 
             let mut record_data = vec![0u8; rec_len as usize];
-            #[cfg(target_os = "unix")]
+            #[cfg(target_os = "linux")]
             if file.read_exact_at(&mut hdr, offset).is_err() {
                 break;
             }

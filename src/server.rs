@@ -1,6 +1,5 @@
 use crate::{config::Config, db::Database, lumina, metrics::METRICS, rpc::*, util::hex_dump};
 use log::*;
-use std::error::Error;
 use std::io::ErrorKind;
 use std::{
     io,
@@ -86,10 +85,7 @@ async fn read_multiproto_bounded<R: tokio::io::AsyncRead + Unpin>(
     let len_field = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
 
     if len_field > max_len_field {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
+        return Err(io::Error::new(ErrorKind::InvalidData, "frame too large"));
     }
 
     r.read_exact(&mut head[4..5]).await?;
@@ -105,26 +101,24 @@ async fn read_multiproto_bounded<R: tokio::io::AsyncRead + Unpin>(
         len_field
     } else {
         if len_field == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid length"));
+            return Err(io::Error::new(ErrorKind::InvalidData, "invalid length"));
         }
         len_field - 1
     };
 
     let total_buf = 1usize
         .checked_add(to_read_payload)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "length overflow"))?;
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "length overflow"))?;
 
-    let g1 = conn_budget.clone().try_reserve(total_buf).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "per-connection memory budget exceeded",
-        )
-    })?;
+    let g1 = conn_budget
+        .clone()
+        .try_reserve(total_buf)
+        .ok_or_else(|| io::Error::new(ErrorKind::Other, "per-connection memory budget exceeded"))?;
 
     let g2 = global_budget
         .clone()
         .try_reserve(total_buf)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "global memory budget exceeded"))?;
+        .ok_or_else(|| io::Error::new(ErrorKind::Other, "global memory budget exceeded"))?;
 
     let mut data = vec![0u8; total_buf];
     data[0] = typ;
@@ -161,7 +155,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             let err_msg = format!("Cannot handle hello frame: {}", e.to_string());
-            return Err(io::Error::new(io::ErrorKind::InvalidData, err_msg));
+            return Err(io::Error::new(ErrorKind::InvalidData, err_msg));
         }
         Err(_) => {
             METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
@@ -172,7 +166,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     let hello_bytes = hello_frame.as_slice();
     debug!("Received hello message, {} bytes", hello_bytes.len());
 
-    if log_enabled!(log::Level::Debug) {
+    if log_enabled!(Level::Debug) {
         debug!("Hello frame hex dump:\n{}", hex_dump(hello_bytes, 256));
     }
 
@@ -262,22 +256,17 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     );
 
     if hello.protocol_version <= 4 {
-        METRICS
-            .lumina_v0_4
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.lumina_v0_4.fetch_add(1, Ordering::Relaxed);
     } else {
-        METRICS
-            .lumina_v5p
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METRICS.lumina_v5p.fetch_add(1, Ordering::Relaxed);
     }
 
     // Check if credentials are configured
-    let auth_required = !cfg.lumina.credentials.is_empty();
+    let auth_required = !cfg.credentials.is_empty();
 
     if auth_required {
         // Check if provided credentials match any in the configured list
         let credentials_valid = cfg
-            .lumina
             .credentials
             .iter()
             .any(|cred| cred.username == hello.username && cred.password == hello.password);
@@ -307,10 +296,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         }
     } else {
         // If no credentials are configured, only allow "guest" user
-        return Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "Cannot be reach",
-        ));
+        return Err(io::Error::new(ErrorKind::Unsupported, "Cannot be reach"));
     }
 
     if is_lumina {
@@ -350,15 +336,13 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             .await
             {
                 Ok(Ok(v)) => v,
-                Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
                 Ok(Err(e)) => {
                     error!("read error: {}", e);
                     return Ok(());
                 }
                 Err(_) => {
-                    METRICS
-                        .timeouts
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
                     lumina::send_lumina_fail(
                         &mut stream,
                         0,
@@ -383,15 +367,13 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             .await
             {
                 Ok(Ok(v)) => v,
-                Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
                 Ok(Err(e)) => {
                     error!("read error: {}", e);
                     return Ok(());
                 }
                 Err(_) => {
-                    METRICS
-                        .timeouts
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
                     write_all(
                         &mut stream,
                         &encode_fail(
@@ -522,7 +504,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
                     METRICS
                         .queried_funcs
-                        .fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(keys.len() as u64, Ordering::Relaxed);
 
                     // Upstream fetch for remaining misses
                     if !cfg.upstreams.is_empty() {
@@ -578,13 +560,12 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                                                 let updated_funcs =
                                                     st.iter().filter(|&&v| v == 0).count() as u64;
                                                 METRICS.pushes.fetch_add(
-                                                    (new_funcs + updated_funcs),
-                                                    std::sync::atomic::Ordering::Relaxed,
+                                                    new_funcs + updated_funcs,
+                                                    Ordering::Relaxed,
                                                 );
-                                                METRICS.new_funcs.fetch_add(
-                                                    new_funcs,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
+                                                METRICS
+                                                    .new_funcs
+                                                    .fetch_add(new_funcs, Ordering::Relaxed);
                                             }
                                             Err(e) => {
                                                 error!("db push after upstream: {}", e);
@@ -606,10 +587,9 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         }
                     }
 
-                    METRICS.pulls.fetch_add(
-                        found_list.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    METRICS
+                        .pulls
+                        .fetch_add(found_list.len() as u64, Ordering::Relaxed);
                     debug!(
                         "Lumina PULL response: {} found, {} not found",
                         found_list.len(),
@@ -1357,7 +1337,7 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
 
             METRICS
                 .active_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
