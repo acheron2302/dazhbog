@@ -115,9 +115,6 @@ pub struct Lumina {
     
     #[serde(default)]
     pub tls: Option<TLS>,
-    
-    #[serde(default)]
-    pub credentials: Vec<Credentials>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,6 +209,9 @@ pub struct Config {
     
     #[serde(default)]
     pub debug: Debug,
+
+    #[serde(default)]
+    pub credentials: Vec<Credentials>,
 }
 
 impl Default for Config {
@@ -224,9 +224,16 @@ impl Default for Config {
             upstreams: Vec::new(),
             scoring: Scoring::default(),
             debug: Debug::default(),
+            // Here the default for credential is guest:guest.
+            credentials: {
+                let mut credentials = Vec::<Credentials>::new();
+                credentials.push(Credentials{username: "guest".to_string(), password: "guest".to_string() });
+                credentials
+            }
         }
     }
 }
+
 
 // Default functions for Limits
 fn default_hello_timeout_ms() -> u64 { 3000 }
@@ -360,7 +367,6 @@ impl Default for Lumina {
             get_history_limit: default_get_history_limit(),
             use_tls: default_use_tls(),
             tls: None,
-            credentials: Vec::new(),
         }
     }
 }

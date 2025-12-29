@@ -1,11 +1,12 @@
 use crate::{config::Config, db::Database, lumina, metrics::METRICS, rpc::*, util::hex_dump};
 use log::*;
+use std::error::Error;
+use std::io::ErrorKind;
 use std::{
     io,
     sync::Arc,
     time::{Duration, Instant},
 };
-use std::error::Error;
 use tokio::io::AsyncReadExt;
 use tokio::{net::TcpListener, time::timeout};
 
@@ -160,12 +161,10 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             let err_msg = format!("Cannot handle hello frame: {}", e.to_string());
-            return Err(io::Error::new(io::ErrorKind::InvalidData, err_msg))
-        },
+            return Err(io::Error::new(io::ErrorKind::InvalidData, err_msg));
+        }
         Err(_) => {
-            METRICS
-                .timeouts
-                .fetch_add(1, Ordering::Relaxed);
+            METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
     };
@@ -206,7 +205,11 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 if let Err(e) = std::fs::create_dir_all(&cfg.debug.dump_hello_dir) {
                     warn!("Failed to create dump directory: {}", e);
                 } else if let Ok(mut f) = std::fs::File::create(&path) {
-                    let id_hex = raw.id_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                    let id_hex = raw
+                        .id_bytes
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>();
                     let content = format!(
                         "ID: {}\n\nLicense:\n\n{}\n\nCredentials: {} / {}\n",
                         id_hex,
@@ -270,22 +273,21 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
     // Check if credentials are configured
     let auth_required = !cfg.lumina.credentials.is_empty();
-    
+
     if auth_required {
         // Check if provided credentials match any in the configured list
-        let credentials_valid = cfg.lumina.credentials.iter().any(|cred| {
-            cred.username == hello.username && cred.password == hello.password
-        });
-        
+        let credentials_valid = cfg
+            .lumina
+            .credentials
+            .iter()
+            .any(|cred| cred.username == hello.username && cred.password == hello.password);
+
         if !credentials_valid {
             if is_lumina {
                 lumina::send_lumina_fail(
                     &mut stream,
                     1,
-                    &format!(
-                        "{}: invalid username or password.",
-                        cfg.lumina.server_name
-                    ),
+                    &format!("{}: invalid username or password.", cfg.lumina.server_name),
                 )
                 .await?;
             } else {
@@ -293,44 +295,22 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     &mut stream,
                     &encode_fail(
                         1,
-                        &format!(
-                            "{}: invalid username or password.",
-                            cfg.lumina.server_name
-                        ),
+                        &format!("{}: invalid username or password.", cfg.lumina.server_name),
                     ),
                 )
                 .await?;
             }
-            return Ok(());
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "invalid username or password",
+            ));
         }
     } else {
         // If no credentials are configured, only allow "guest" user
-        if hello.username != "guest" {
-            if is_lumina {
-                lumina::send_lumina_fail(
-                    &mut stream,
-                    1,
-                    &format!(
-                        "{}: invalid username or password. Try logging in with `guest` instead.",
-                        cfg.lumina.server_name
-                    ),
-                )
-                .await?;
-            } else {
-                write_all(
-                    &mut stream,
-                    &encode_fail(
-                        1,
-                        &format!(
-                            "{}: invalid username or password. Try logging in with `guest` instead.",
-                            cfg.lumina.server_name
-                        ),
-                    ),
-                )
-                .await?;
-            }
-            return Ok(());
-        }
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "Cannot be reach",
+        ));
     }
 
     if is_lumina {
@@ -937,7 +917,10 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         }
                     }
                     if !missing_keys.is_empty() {
-                        debug!("Upstream fetch: {} keys (after filtering failure cache)", missing_keys.len());
+                        debug!(
+                            "Upstream fetch: {} keys (after filtering failure cache)",
+                            missing_keys.len()
+                        );
                         match crate::upstream::fetch_from_upstreams(&cfg.upstreams, &missing_keys)
                             .await
                         {
@@ -1067,12 +1050,12 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         METRICS
                             .new_funcs
                             .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
-                        
+
                         // Remove successfully pushed keys from failure cache
                         for it in &items {
                             db.failure_cache.remove(it.key);
                         }
-                        
+
                         debug!(
                             "PUSH response: {} new, {} updated, {} unchanged (took {:?})",
                             new_funcs,
@@ -1333,7 +1316,9 @@ pub async fn serve_binary_rpc(cfg: Arc<Config>, db: Arc<Database>) {
                         Ok(_) => false,
                         Err(_) => false,
                     }
-                }).await.unwrap_or_else(|_| false);
+                })
+                .await
+                .unwrap_or_else(|_| false);
 
                 if is_tls {
                     debug!("{}: sniffed TLS ClientHello; upgrading connection", addr);
