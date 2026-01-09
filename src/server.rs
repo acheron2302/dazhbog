@@ -1,3 +1,4 @@
+use tokio::io::{AsyncRead, AsyncWrite};
 use crate::{config::Config, db::Database, lumina, metrics::METRICS, rpc::*, util::hex_dump};
 use log::*;
 use std::io::ErrorKind;
@@ -6,7 +7,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::TcpListener, time::timeout};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +17,1007 @@ struct Budget {
     used: AtomicUsize,
 }
 
+enum ProtocolHandler {
+    Lumina(LuminaHandler),
+    Legacy(LegacyHandler),
+}
+
+struct LuminaHandler;
+
+impl LuminaHandler {
+    async fn handle_hello(&self, stream: &mut (impl AsyncRead + AsyncWrite + Unpin), frame: &[u8], cfg: &Config, _db: &Database) -> io::Result<()> {
+        let hello_bytes = frame;
+        debug!("Received Lumina hello message, {} bytes", hello_bytes.len());
+
+        if log_enabled!(Level::Debug) {
+            debug!("Hello frame hex dump:\n{}", hex_dump(hello_bytes, 256));
+        }
+
+        if hello_bytes.is_empty() {
+            lumina::send_lumina_fail(stream, 0, "bad sequence").await?;
+            return Ok(());
+        }
+
+        let msg_type = hello_bytes[0];
+        let payload = &hello_bytes[1..];
+
+        if msg_type != 0x0d {
+            error!("Not a Lumina Hello message: 0x{:02x}", msg_type);
+            lumina::send_lumina_fail(stream, 0, "bad sequence").await?;
+            return Ok(());
+        }
+
+        debug!("Detected Lumina Hello message (0x0d)");
+        let hello = match lumina::parse_lumina_hello(payload) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to parse Lumina Hello: {}", e);
+                lumina::send_lumina_fail(stream, 0, "invalid hello").await?;
+                return Ok(());
+            }
+        };
+
+        debug!(
+            "Hello request: protocol_version={}, username={}",
+            hello.protocol_version, hello.username
+        );
+
+        if hello.protocol_version <= 4 {
+            METRICS.lumina_v0_4.fetch_add(1, Ordering::Relaxed);
+        } else {
+            METRICS.lumina_v5p.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Check if provided credentials match any in the configured list
+        let credentials_valid = cfg
+            .credentials
+            .iter()
+            .any(|cred| cred.username == hello.username && cred.password == hello.password);
+
+        if !credentials_valid {
+            lumina::send_lumina_fail(
+                stream,
+                1,
+                &format!("{}: invalid username or password.", cfg.lumina.server_name),
+            )
+            .await?;
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "invalid username or password",
+            ));
+        }
+
+        if hello.protocol_version <= 4 {
+            lumina::send_lumina_ok(stream).await?;
+        } else {
+            let mut features = 0u32;
+            if cfg.lumina.allow_deletes {
+                features |= 0x02;
+            }
+            lumina::send_lumina_hello_result(stream, features).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_command(&self, stream: &mut (impl AsyncRead + AsyncWrite + Unpin), frame: &[u8], cfg: &Config, db: &Database) -> io::Result<bool> {
+        if frame.is_empty() {
+            lumina::send_lumina_fail(
+                stream,
+                0,
+                &format!("{}: error: invalid data.\n", cfg.lumina.server_name),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let typ = frame[0];
+        let pld = &frame[1..];
+
+        debug!(
+            "Incoming Lumina message: type=0x{:02x}, payload_size={}",
+            typ,
+            pld.len()
+        );
+
+        match typ {
+            0x0e => {
+                // PullMetadata
+                let caps = lumina::LuminaCaps {
+                    max_funcs: cfg.limits.max_pull_items,
+                    max_name_bytes: cfg.limits.max_name_bytes,
+                    max_data_bytes: cfg.limits.max_data_bytes,
+                    max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                    max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
+                };
+
+                let pull_msg = match lumina::parse_lumina_pull_metadata(pld, caps) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to parse Lumina PullMetadata: {}", e);
+                        lumina::send_lumina_fail(stream, 0, "invalid pull").await?;
+                        return Ok(true);
+                    }
+                };
+
+                // Collect keys in request order
+                let mut keys: Vec<u128> = Vec::with_capacity(pull_msg.funcs.len());
+                for func in &pull_msg.funcs {
+                    if func.mb_hash.len() != 16 {
+                        keys.push(0);
+                    } else {
+                        let key = u128::from_be_bytes([
+                            func.mb_hash[0], func.mb_hash[1], func.mb_hash[2], func.mb_hash[3],
+                            func.mb_hash[4], func.mb_hash[5], func.mb_hash[6], func.mb_hash[7],
+                            func.mb_hash[8], func.mb_hash[9], func.mb_hash[10], func.mb_hash[11],
+                            func.mb_hash[12], func.mb_hash[13], func.mb_hash[14], func.mb_hash[15],
+                        ]);
+                        keys.push(key);
+                    }
+                }
+
+                let qctx = crate::db::QueryContext {
+                    keys: &keys,
+                    md5: None,
+                    basename: None,
+                    hostname: None,
+                };
+                let selected = match db.select_versions_for_batch(&qctx).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("scoring error: {}", e);
+                        // Fallback to legacy latest-per-key
+                        let mut v = Vec::with_capacity(keys.len());
+                        for &k in &keys {
+                            v.push(
+                                db.get_latest(k)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|f| (f.popularity, f.len_bytes, f.name, f.data)),
+                            );
+                        }
+                        v
+                    }
+                };
+
+                let mut maybe_funcs: Vec<Option<(u32, u32, String, Vec<u8>)>> = selected;
+                let mut statuses: Vec<u32> = maybe_funcs
+                    .iter()
+                    .map(|o| if o.is_some() { 0 } else { 1 })
+                    .collect();
+
+                METRICS
+                    .queried_funcs
+                    .fetch_add(keys.len() as u64, Ordering::Relaxed);
+
+                // Upstream fetch for remaining misses
+                if !cfg.upstreams.is_empty() {
+                    let mut missing_keys = Vec::new();
+                    let mut missing_pos = Vec::new();
+                    for (i, (&k, st)) in keys.iter().zip(statuses.iter()).enumerate() {
+                        if k != 0 && *st == 1 {
+                            missing_keys.push(k);
+                            missing_pos.push(i);
+                        }
+                    }
+                    if !missing_keys.is_empty() {
+                        match crate::upstream::fetch_from_upstreams(
+                            &cfg.upstreams,
+                            &missing_keys,
+                        )
+                        .await
+                        {
+                            Ok(fetched) => {
+                                let mut new_inserts_owned: Vec<(
+                                    u128,
+                                    u32,
+                                    u32,
+                                    String,
+                                    Vec<u8>,
+                                )> = Vec::new();
+                                for (j, item) in fetched.into_iter().enumerate() {
+                                    let idx = missing_pos[j];
+                                    if let Some((pop, len, name, data)) = item {
+                                        statuses[idx] = 0;
+                                        new_inserts_owned.push((
+                                            missing_keys[j],
+                                            pop,
+                                            len,
+                                            name.clone(),
+                                            data.clone(),
+                                        ));
+                                        maybe_funcs[idx] = Some((pop, len, name, data));
+                                    }
+                                }
+                                let new_inserts: Vec<(u128, u32, u32, &str, &[u8])> =
+                                    new_inserts_owned
+                                        .iter()
+                                        .map(|(k, p, l, n, d)| {
+                                            (*k, *p, *l, n.as_str(), d.as_slice())
+                                        })
+                                        .collect();
+                                if !new_inserts.is_empty() {
+                                    match db.push(&new_inserts).await {
+                                        Ok(st) => {
+                                            let new_funcs =
+                                                st.iter().filter(|&&v| v == 1).count() as u64;
+                                            let updated_funcs =
+                                                st.iter().filter(|&&v| v == 0).count() as u64;
+                                            METRICS.pushes.fetch_add(
+                                                new_funcs + updated_funcs,
+                                                Ordering::Relaxed,
+                                            );
+                                            METRICS
+                                                .new_funcs
+                                                .fetch_add(new_funcs, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            error!("db push after upstream: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("upstream pull failed: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                let mut found_list = Vec::new();
+                for it in maybe_funcs.into_iter() {
+                    if let Some(v) = it {
+                        found_list.push(v);
+                    }
+                }
+
+                METRICS
+                    .pulls
+                    .fetch_add(found_list.len() as u64, Ordering::Relaxed);
+                debug!(
+                    "Lumina PULL response: {} found, {} not found",
+                    found_list.len(),
+                    statuses.iter().filter(|&&s| s == 1).count()
+                );
+                lumina::send_lumina_pull_result(stream, &statuses, &found_list).await?;
+            }
+            0x10 => {
+                // PushMetadata
+                let caps = lumina::LuminaCaps {
+                    max_funcs: cfg.limits.max_push_items,
+                    max_name_bytes: cfg.limits.max_name_bytes,
+                    max_data_bytes: cfg.limits.max_data_bytes,
+                    max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                    max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
+                };
+
+                let push_msg = match lumina::parse_lumina_push_metadata(pld, caps) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to parse Lumina PushMetadata: {}", e);
+                        lumina::send_lumina_fail(stream, 0, "invalid push").await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("Lumina PUSH request: {} items", push_msg.funcs.len());
+
+                // Print push request metadata
+                println!("\n=== PUSH REQUEST ===");
+                println!("IDB Path:     {}", push_msg.idb_path);
+                println!("File Path:    {}", push_msg.file_path);
+                println!(
+                    "MD5:          {}",
+                    push_msg
+                        .md5
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
+                );
+                println!("Functions:    {}", push_msg.funcs.len());
+                println!("===================\n");
+
+                let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> =
+                    Vec::with_capacity(push_msg.funcs.len());
+                for func in &push_msg.funcs {
+                    if func.hash.len() != 16 {
+                        error!("Invalid hash length: {}", func.hash.len());
+                        continue;
+                    }
+                    let key = u128::from_be_bytes([
+                        func.hash[0], func.hash[1], func.hash[2], func.hash[3],
+                        func.hash[4], func.hash[5], func.hash[6], func.hash[7],
+                        func.hash[8], func.hash[9], func.hash[10], func.hash[11],
+                        func.hash[12], func.hash[13], func.hash[14], func.hash[15],
+                    ]);
+                    inlined.push((key, 0, func.func_len, &func.name, &func.func_data));
+                }
+
+                // Extract binary context
+                let basename = std::path::Path::new(&push_msg.file_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let ctx = crate::db::PushContext {
+                    md5: Some(push_msg.md5),
+                    basename: Some(basename),
+                    hostname: Some(push_msg.hostname.as_str()),
+                };
+
+                match db.push_with_ctx(&inlined, &ctx).await {
+                    Ok(status) => {
+                        let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
+                        let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
+                        let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
+
+                        METRICS.pushes.fetch_add(
+                            new_funcs + updated_funcs,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        METRICS
+                            .new_funcs
+                            .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+
+                        debug!(
+                            "Lumina PUSH response: {} new, {} updated, {} unchanged",
+                            new_funcs, updated_funcs, skipped_funcs
+                        );
+
+                        let lumina_status: Vec<u32> =
+                            status.iter().map(|&s| if s == 2 { 0 } else { 1 }).collect();
+                        lumina::send_lumina_push_result(stream, &lumina_status).await?;
+                    }
+                    Err(e) => {
+                        error!("db push: {}", e);
+                        lumina::send_lumina_fail(
+                            stream,
+                            0,
+                            &format!(
+                                "{}: db error; please try again later",
+                                cfg.lumina.server_name
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            0x18 => {
+                // DelHistory
+                if !cfg.lumina.allow_deletes {
+                    lumina::send_lumina_fail(
+                        stream,
+                        2,
+                        &format!(
+                            "{}: Delete command is disabled on this server.",
+                            cfg.lumina.server_name
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                
+                let caps = lumina::LuminaCaps {
+                    max_funcs: cfg.limits.max_del_items,
+                    max_name_bytes: cfg.limits.max_name_bytes,
+                    max_data_bytes: cfg.limits.max_data_bytes,
+                    max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                    max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
+                };
+
+                let del_msg = match lumina::parse_lumina_del_history(pld, caps) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to parse Lumina DelHistory: {}", e);
+                        lumina::send_lumina_fail(stream, 0, "invalid del").await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("Lumina DEL request: {} items", del_msg.funcs.len());
+
+                let mut keys: Vec<u128> = Vec::with_capacity(del_msg.funcs.len());
+                for func in &del_msg.funcs {
+                    if func.mb_hash.len() != 16 {
+                        continue;
+                    }
+                    let key = u128::from_be_bytes([
+                        func.mb_hash[0], func.mb_hash[1], func.mb_hash[2], func.mb_hash[3],
+                        func.mb_hash[4], func.mb_hash[5], func.mb_hash[6], func.mb_hash[7],
+                        func.mb_hash[8], func.mb_hash[9], func.mb_hash[10], func.mb_hash[11],
+                        func.mb_hash[12], func.mb_hash[13], func.mb_hash[14], func.mb_hash[15],
+                    ]);
+                    keys.push(key);
+                }
+
+                match db.delete_keys(&keys).await {
+                    Ok(n) => {
+                        debug!(
+                            "Lumina DEL response: {} keys deleted",
+                            n
+                        );
+                        lumina::send_lumina_del_result(stream, n).await?;
+                    }
+                    Err(e) => {
+                        error!("db del: {}", e);
+                        lumina::send_lumina_fail(
+                            stream,
+                            3,
+                            &format!(
+                                "{}: db error, please try again later.",
+                                cfg.lumina.server_name
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            0x2f => {
+                // GetFuncHistories
+                let caps = lumina::LuminaCaps {
+                    max_funcs: cfg.limits.max_hist_items,
+                    max_name_bytes: cfg.limits.max_name_bytes,
+                    max_data_bytes: cfg.limits.max_data_bytes,
+                    max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
+                    max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
+                };
+
+                let hist_msg = match lumina::parse_lumina_get_func_histories(pld, caps) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to parse Lumina GetFuncHistories: {}", e);
+                        lumina::send_lumina_fail(stream, 0, "invalid hist").await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("Lumina HIST request: {} keys", hist_msg.funcs.len());
+
+                let limit = if cfg.lumina.get_history_limit == 0 {
+                    0
+                } else {
+                    cfg.lumina.get_history_limit
+                };
+                if limit == 0 {
+                    lumina::send_lumina_fail(
+                        stream,
+                        4,
+                        &format!(
+                            "{}: function histories are disabled on this server.",
+                            cfg.lumina.server_name
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
+                let mut statuses = Vec::new();
+                let mut histories = Vec::new();
+
+                for func in &hist_msg.funcs {
+                    if func.mb_hash.len() != 16 {
+                        statuses.push(0);
+                        continue;
+                    }
+                    let key = u128::from_be_bytes([
+                        func.mb_hash[0], func.mb_hash[1], func.mb_hash[2], func.mb_hash[3],
+                        func.mb_hash[4], func.mb_hash[5], func.mb_hash[6], func.mb_hash[7],
+                        func.mb_hash[8], func.mb_hash[9], func.mb_hash[10], func.mb_hash[11],
+                        func.mb_hash[12], func.mb_hash[13], func.mb_hash[14], func.mb_hash[15],
+                    ]);
+
+                    match db.get_history(key, limit).await {
+                        Ok(hist) if !hist.is_empty() => {
+                            statuses.push(1);
+                            let hist_tuples: Vec<(u64, String, Vec<u8>)> = hist
+                                .into_iter()
+                                .map(|(ts, name, data)| (ts, name, data))
+                                .collect();
+                            histories.push(hist_tuples);
+                        }
+                        Ok(_) => {
+                            statuses.push(0);
+                        }
+                        Err(e) => {
+                            error!("db hist: {}", e);
+                            lumina::send_lumina_fail(
+                                stream,
+                                3,
+                                &format!("{}: db error", cfg.lumina.server_name),
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                debug!("Lumina HIST response: {} histories found", histories.len());
+                lumina::send_lumina_histories_result(stream, &statuses, &histories)
+                    .await?;
+            }
+            _ => {
+                warn!("Unknown Lumina command: 0x{:02x}", typ);
+                lumina::send_lumina_fail(
+                    stream,
+                    0,
+                    &format!("{}: Unknown command.", cfg.lumina.server_name),
+                )
+                .await?;
+            }
+        }
+        Ok(true)
+    }
+}
+
+struct LegacyHandler;
+
+impl LegacyHandler {
+    async fn handle_hello(&self, stream: &mut (impl AsyncRead + AsyncWrite + Unpin), frame: &[u8], cfg: &Config, _db: &Database) -> io::Result<()> {
+        let hello_bytes = frame;
+        debug!("Received Legacy hello message, {} bytes", hello_bytes.len());
+
+        if log_enabled!(Level::Debug) {
+            debug!("Hello frame hex dump:\n{}", hex_dump(hello_bytes, 256));
+        }
+
+        if hello_bytes.is_empty() {
+            write_all(stream, &encode_fail(0, "bad sequence")).await?;
+            return Ok(());
+        }
+
+        let msg_type = hello_bytes[0];
+        let payload = &hello_bytes[1..];
+
+        if msg_type != MSG_HELLO {
+            error!("Not a Legacy Hello message: 0x{:02x}", msg_type);
+            write_all(stream, &encode_fail(0, "bad sequence")).await?;
+            return Ok(());
+        }
+
+        debug!("Detected new Hello message (0x01)");
+        let hello = match decode_hello(payload) {
+            Ok(v) => v,
+            Err(_) => {
+                write_all(stream, &encode_fail(0, "invalid hello")).await?;
+                return Ok(());
+            }
+        };
+
+        debug!(
+            "Hello request: protocol_version={}, username={}",
+            hello.protocol_version, hello.username
+        );
+
+        if hello.protocol_version <= 4 {
+            METRICS.lumina_v0_4.fetch_add(1, Ordering::Relaxed);
+        } else {
+            METRICS.lumina_v5p.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Check if provided credentials match any in the configured list
+        let credentials_valid = cfg
+            .credentials
+            .iter()
+            .any(|cred| cred.username == hello.username && cred.password == hello.password);
+
+        if !credentials_valid {
+            write_all(
+                stream,
+                &encode_fail(
+                    1,
+                    &format!("{}: invalid username or password.", cfg.lumina.server_name),
+                ),
+            )
+            .await?;
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "invalid username or password",
+            ));
+        }
+
+        if hello.protocol_version <= 4 {
+            write_all(stream, &encode_ok()).await?;
+        } else {
+            let mut features = 0u32;
+            if cfg.lumina.allow_deletes {
+                features |= 0x02;
+            }
+            write_all(stream, &encode_hello_ok(features)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_command(&self, stream: &mut (impl AsyncRead + AsyncWrite + Unpin), frame: &[u8], cfg: &Config, db: &Database) -> io::Result<bool> {
+        if frame.is_empty() {
+            write_all(
+                stream,
+                &encode_fail(
+                    0,
+                    &format!("{}: error: invalid data.\n", cfg.lumina.server_name),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let typ = frame[0];
+        let pld = &frame[1..];
+
+        debug!(
+            "Incoming Legacy message: type=0x{:02x}, payload_size={}",
+            typ,
+            pld.len()
+        );
+
+        let msg_start = Instant::now();
+
+        match typ {
+            MSG_PULL => {
+                let keys = match decode_pull(pld, cfg.limits.max_pull_items) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("decode_pull: {:?}", e);
+                        write_all(stream, &encode_fail(0, "invalid pull")).await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("PULL request: {} keys", keys.len());
+                METRICS
+                    .queried_funcs
+                    .fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+                let qctx = crate::db::QueryContext {
+                    keys: &keys,
+                    md5: None,
+                    basename: None,
+                    hostname: None,
+                };
+                let selected = match db.select_versions_for_batch(&qctx).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("scoring error: {}", e);
+                        let mut v = Vec::with_capacity(keys.len());
+                        for &k in &keys {
+                            v.push(
+                                db.get_latest(k)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|f| (f.popularity, f.len_bytes, f.name, f.data)),
+                            );
+                        }
+                        v
+                    }
+                };
+
+                let mut maybe_funcs: Vec<Option<(u32, u32, String, Vec<u8>)>> = selected;
+                let mut statuses: Vec<u32> = maybe_funcs
+                    .iter()
+                    .map(|o| if o.is_some() { 0 } else { 1 })
+                    .collect();
+
+                // Upstream fetch for misses
+                if !cfg.upstreams.is_empty() {
+                    let mut missing_keys = Vec::new();
+                    let mut missing_pos = Vec::new();
+                    for (i, (&k, st)) in keys.iter().zip(statuses.iter()).enumerate() {
+                        if *st == 1 {
+                            // Skip keys that are in the failure cache
+                            if !db.failure_cache.is_failed(k) {
+                                missing_keys.push(k);
+                                missing_pos.push(i);
+                            }
+                        }
+                    }
+                    if !missing_keys.is_empty() {
+                        debug!(
+                            "Upstream fetch: {} keys (after filtering failure cache)",
+                            missing_keys.len()
+                        );
+                        match crate::upstream::fetch_from_upstreams(&cfg.upstreams, &missing_keys)
+                            .await
+                        {
+                            Ok(fetched) => {
+                                let mut new_inserts_owned: Vec<(u128, u32, u32, String, Vec<u8>)> =
+                                    Vec::new();
+                                for (j, item) in fetched.into_iter().enumerate() {
+                                    let idx = missing_pos[j];
+                                    let key = missing_keys[j];
+                                    if let Some((pop, len, name, data)) = item {
+                                        statuses[idx] = 0;
+                                        new_inserts_owned.push((
+                                            key,
+                                            pop,
+                                            len,
+                                            name.clone(),
+                                            data.clone(),
+                                        ));
+                                        maybe_funcs[idx] = Some((pop, len, name, data));
+                                    } else {
+                                        // Not found in upstream - add to failure cache
+                                        db.failure_cache.insert(key);
+                                    }
+                                }
+                                let new_inserts: Vec<(u128, u32, u32, &str, &[u8])> =
+                                    new_inserts_owned
+                                        .iter()
+                                        .map(|(k, p, l, n, d)| {
+                                            (*k, *p, *l, n.as_str(), d.as_slice())
+                                        })
+                                        .collect();
+                                if !new_inserts_owned.is_empty() {
+                                    match db.push(&new_inserts).await {
+                                        Ok(st) => {
+                                            let new_funcs =
+                                                st.iter().filter(|&&v| v == 1).count() as u64;
+                                            let updated_funcs =
+                                                st.iter().filter(|&&v| v == 0).count() as u64;
+                                            METRICS.pushes.fetch_add(
+                                                new_funcs + updated_funcs,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            METRICS.new_funcs.fetch_add(
+                                                new_funcs,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("db push after upstream: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("upstream pull failed: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                let mut found = Vec::new();
+                for it in maybe_funcs.into_iter() {
+                    if let Some(v) = it {
+                        found.push(v);
+                    }
+                }
+
+                METRICS
+                    .pulls
+                    .fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                debug!(
+                    "PULL response: {} found, {} not found (took {:?})",
+                    found.len(),
+                    statuses.iter().filter(|&&s| s == 1).count(),
+                    msg_start.elapsed()
+                );
+                write_all(stream, &encode_pull_ok(&statuses, &found)).await?;
+            }
+            MSG_PUSH => {
+                let caps = PushCaps {
+                    max_items: cfg.limits.max_push_items,
+                    max_name_bytes: cfg.limits.max_name_bytes,
+                    max_data_bytes: cfg.limits.max_data_bytes,
+                };
+
+                let items = match decode_push(pld, &caps) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("decode_push: {:?}", e);
+                        write_all(stream, &encode_fail(0, "invalid push")).await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("PUSH request: {} items", items.len());
+
+                if log_enabled!(log::Level::Debug) {
+                    for (i, item) in items.iter().enumerate().take(5) {
+                        debug!(
+                            "  Item[{}]: key=0x{:032x}, pop={}, len={}, name='{}'",
+                            i, item.key, item.popularity, item.len_bytes, item.name
+                        );
+                        debug!("    Data hex dump:\n{}", hex_dump(&item.data, 128));
+                    }
+                    if items.len() > 5 {
+                        debug!("  ... and {} more items", items.len() - 5);
+                    }
+                }
+
+                let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> =
+                    Vec::with_capacity(items.len());
+                for it in &items {
+                    inlined.push((it.key, it.popularity, it.len_bytes, &it.name, &it.data));
+                }
+
+                let res = db.push(&inlined).await;
+
+                match res {
+                    Ok(status) => {
+                        let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
+                        let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
+                        let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
+                        METRICS.pushes.fetch_add(
+                            new_funcs + updated_funcs,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        METRICS
+                            .new_funcs
+                            .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
+
+                        // Remove successfully pushed keys from failure cache
+                        for it in &items {
+                            db.failure_cache.remove(it.key);
+                        }
+
+                        debug!(
+                            "PUSH response: {} new, {} updated, {} unchanged (took {:?})",
+                            new_funcs,
+                            updated_funcs,
+                            skipped_funcs,
+                            msg_start.elapsed()
+                        );
+                        write_all(stream, &encode_push_ok(&status)).await?;
+                    }
+                    Err(e) => {
+                        error!("db push: {}", e);
+                        write_all(
+                            stream,
+                            &encode_fail(
+                                0,
+                                &format!(
+                                    "{}: db error; please try again later..\n",
+                                    cfg.lumina.server_name
+                                ),
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            MSG_DEL => {
+                if !cfg.lumina.allow_deletes {
+                    write_all(
+                        stream,
+                        &encode_fail(
+                            2,
+                            &format!(
+                                "{}: Delete command is disabled on this server.",
+                                cfg.lumina.server_name
+                            ),
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
+                let keys = match decode_del(pld, cfg.limits.max_del_items) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("decode_del: {:?}", e);
+                        write_all(stream, &encode_fail(0, "invalid del")).await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("DEL request: {} keys", keys.len());
+
+                match db.delete_keys(&keys).await {
+                    Ok(n) => {
+                        debug!(
+                            "DEL response: {} keys deleted (took {:?})",
+                            n,
+                            msg_start.elapsed()
+                        );
+                        write_all(stream, &encode_del_ok(n)).await?;
+                    }
+                    Err(e) => {
+                        error!("db del: {}", e);
+                        write_all(
+                            stream,
+                            &encode_fail(
+                                3,
+                                &format!(
+                                    "{}: db error, please try again later.",
+                                    cfg.lumina.server_name
+                                ),
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            MSG_HIST => {
+                let (limit_req, keys) = match decode_hist(pld, cfg.limits.max_hist_items) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("decode_hist: {:?}", e);
+                        write_all(stream, &encode_fail(0, "invalid hist")).await?;
+                        return Ok(true);
+                    }
+                };
+
+                debug!("HIST request: limit={}, {} keys", limit_req, keys.len());
+
+                let limit = if cfg.lumina.get_history_limit == 0 {
+                    0
+                } else {
+                    cfg.lumina.get_history_limit.min(limit_req)
+                };
+                if limit == 0 {
+                    write_all(
+                        stream,
+                        &encode_fail(
+                            4,
+                            &format!(
+                                "{}: function histories are disabled on this server.",
+                                cfg.lumina.server_name
+                            ),
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
+                let mut statuses = Vec::with_capacity(keys.len());
+                let mut logs = Vec::new();
+
+                for k in keys {
+                    match db.get_history(k, limit).await {
+                        Ok(v) if !v.is_empty() => {
+                            statuses.push(1);
+                            logs.push(v);
+                        }
+                        Ok(_) => {
+                            statuses.push(0);
+                        }
+                        Err(e) => {
+                            error!("db hist: {}", e);
+                            write_all(
+                                stream,
+                                &encode_fail(
+                                    3,
+                                    &format!(
+                                        "{}: db error, please try again later.",
+                                        cfg.lumina.server_name
+                                    ),
+                                ),
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                let found_histories = logs.len();
+                debug!(
+                    "HIST response: {} histories found (took {:?})",
+                    found_histories,
+                    msg_start.elapsed()
+                );
+                write_all(stream, &encode_hist_ok(&statuses, &logs)).await?;
+            }
+            _ => {
+                debug!(
+                    "Unknown message type: 0x{:02x}, payload size: {} (took {:?})",
+                    typ,
+                    pld.len(),
+                    msg_start.elapsed()
+                );
+                if log_enabled!(log::Level::Debug) && !pld.is_empty() {
+                    debug!("Unknown message payload hex dump:\n{}", hex_dump(pld, 256));
+                }
+                write_all(
+                    stream,
+                    &encode_fail(0, &format!("{}: invalid data.\n", cfg.lumina.server_name)),
+                )
+                .await?;
+            }
+        }
+        Ok(true)
+    }
+}
 impl Budget {
     fn new(limit: usize) -> Self {
         Self {
@@ -81,14 +1083,51 @@ async fn read_multiproto_bounded<R: tokio::io::AsyncRead + Unpin>(
 ) -> io::Result<OwnedFrame> {
     let mut head = [0u8; 5];
 
-    r.read_exact(&mut head[..4]).await?;
+    // Read the first 4 bytes (length field) using streaming
+    let mut bytes_read = 0;
+    while bytes_read < 4 {
+        match r.read(&mut head[bytes_read..4]).await {
+            Ok(0) => {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "unexpected EOF while reading length"));
+            }
+            Ok(n) => {
+                bytes_read += n;
+                if bytes_read < 4 {
+                    // Continue reading if we haven't got all 4 bytes yet
+                    continue;
+                }
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
     let len_field = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
 
     if len_field > max_len_field {
         return Err(io::Error::new(ErrorKind::InvalidData, "frame too large"));
     }
 
-    r.read_exact(&mut head[4..5]).await?;
+    // Read the message type byte using streaming
+    bytes_read = 0;
+    while bytes_read < 1 {
+        match r.read(&mut head[4..5]).await {
+            Ok(0) => {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "unexpected EOF while reading type"));
+            }
+            Ok(n) => {
+                bytes_read += n;
+                if bytes_read < 1 {
+                    continue;
+                }
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
     let typ = head[4];
 
     let is_legacy_final = if let Some(b) = is_legacy {
@@ -123,7 +1162,32 @@ async fn read_multiproto_bounded<R: tokio::io::AsyncRead + Unpin>(
     let mut data = vec![0u8; total_buf];
     data[0] = typ;
 
-    r.read_exact(&mut data[1..]).await?;
+    // Read the payload using streaming approach
+    let mut bytes_read = 0;
+    let mut payload_remaining = to_read_payload;
+    
+    while bytes_read < to_read_payload {
+        let to_read = std::cmp::min(payload_remaining, 8192); // Read in chunks of 8KB
+        let start_idx = 1 + bytes_read;
+        let end_idx = start_idx + to_read;
+        
+        match r.read(&mut data[start_idx..end_idx]).await {
+            Ok(0) => {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "unexpected EOF while reading payload"));
+            }
+            Ok(n) => {
+                bytes_read += n;
+                payload_remaining -= n;
+                if n < to_read {
+                    // If we didn't get a full chunk, continue reading
+                    continue;
+                }
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
 
     Ok(OwnedFrame {
         buf: data,
@@ -221,128 +1285,44 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         }
     }
 
-    let hello = if is_lumina {
-        debug!("Detected Lumina Hello message (0x0d)");
-        match lumina::parse_lumina_hello(payload) {
-            Ok(v) => HelloReq {
-                protocol_version: v.protocol_version,
-                username: v.username,
-                password: v.password,
-            },
-            Err(e) => {
-                error!("Failed to parse Lumina Hello: {}", e);
-                write_all(&mut stream, &encode_fail(0, "invalid hello")).await?;
-                return Ok(());
-            }
-        }
-    } else if msg_type == MSG_HELLO {
-        debug!("Detected new Hello message (0x01)");
-        match decode_hello(payload) {
-            Ok(v) => v,
-            Err(_) => {
-                write_all(&mut stream, &encode_fail(0, "invalid hello")).await?;
-                return Ok(());
-            }
-        }
+    // Determine which protocol handler to use
+    let handler = if is_lumina {
+        ProtocolHandler::Lumina(LuminaHandler)
     } else {
-        error!("Unknown Hello message type: 0x{:02x}", msg_type);
-        write_all(&mut stream, &encode_fail(0, "bad sequence")).await?;
-        return Ok(());
+        ProtocolHandler::Legacy(LegacyHandler)
     };
 
-    debug!(
-        "Hello request: protocol_version={}, username={}",
-        hello.protocol_version, hello.username
-    );
-
-    if hello.protocol_version <= 4 {
-        METRICS.lumina_v0_4.fetch_add(1, Ordering::Relaxed);
-    } else {
-        METRICS.lumina_v5p.fetch_add(1, Ordering::Relaxed);
+    // Handle hello using the appropriate protocol handler
+    if let Err(e) = match &handler {
+        ProtocolHandler::Lumina(h) => h.handle_hello(&mut stream, hello_bytes, &cfg, &db).await,
+        ProtocolHandler::Legacy(h) => h.handle_hello(&mut stream, hello_bytes, &cfg, &db).await,
+    } {
+        return Err(e);
     }
 
-    // Check if credentials are configured
-    let auth_required = !cfg.credentials.is_empty();
-
-    if auth_required {
-        // Check if provided credentials match any in the configured list
-        let credentials_valid = cfg
-            .credentials
-            .iter()
-            .any(|cred| cred.username == hello.username && cred.password == hello.password);
-
-        if !credentials_valid {
-            if is_lumina {
-                lumina::send_lumina_fail(
-                    &mut stream,
-                    1,
-                    &format!("{}: invalid username or password.", cfg.lumina.server_name),
-                )
-                .await?;
-            } else {
-                write_all(
-                    &mut stream,
-                    &encode_fail(
-                        1,
-                        &format!("{}: invalid username or password.", cfg.lumina.server_name),
-                    ),
-                )
-                .await?;
-            }
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                "invalid username or password",
-            ));
-        }
-    } else {
-        // If no credentials are configured, only allow "guest" user
-        return Err(io::Error::new(ErrorKind::Unsupported, "Cannot be reach"));
-    }
-
-    if is_lumina {
-        if hello.protocol_version <= 4 {
-            lumina::send_lumina_ok(&mut stream).await?;
-        } else {
-            let mut features = 0u32;
-            if cfg.lumina.allow_deletes {
-                features |= 0x02;
-            }
-            lumina::send_lumina_hello_result(&mut stream, features).await?;
-        }
-    } else {
-        if hello.protocol_version <= 4 {
-            write_all(&mut stream, &encode_ok()).await?;
-        } else {
-            let mut features = 0u32;
-            if cfg.lumina.allow_deletes {
-                features |= 0x02;
-            }
-            write_all(&mut stream, &encode_hello_ok(features)).await?;
-        }
-    }
-
+    // Main command loop
     loop {
-        let frame = if is_lumina {
-            match timeout(
-                Duration::from_millis(cfg.limits.command_timeout_ms),
-                read_multiproto_bounded(
-                    &mut stream,
-                    Some(true),
-                    cfg.limits.max_cmd_frame_bytes,
-                    &conn_budget,
-                    &global_budget,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
-                Ok(Err(e)) => {
-                    error!("read error: {}", e);
-                    return Ok(());
-                }
-                Err(_) => {
-                    METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
+        let frame = match timeout(
+            Duration::from_millis(cfg.limits.command_timeout_ms),
+            read_multiproto_bounded(
+                &mut stream,
+                Some(is_lumina),
+                cfg.limits.max_cmd_frame_bytes,
+                &conn_budget,
+                &global_budget,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) => {
+                error!("read error: {}", e);
+                return Ok(());
+            }
+            Err(_) => {
+                METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
+                if is_lumina {
                     lumina::send_lumina_fail(
                         &mut stream,
                         0,
@@ -350,30 +1330,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     )
                     .await
                     .ok();
-                    return Ok(());
-                }
-            }
-        } else {
-            match timeout(
-                Duration::from_millis(cfg.limits.command_timeout_ms),
-                read_multiproto_bounded(
-                    &mut stream,
-                    Some(false),
-                    cfg.limits.max_cmd_frame_bytes,
-                    &conn_budget,
-                    &global_budget,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
-                Ok(Err(e)) => {
-                    error!("read error: {}", e);
-                    return Ok(());
-                }
-                Err(_) => {
-                    METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
+                } else {
                     write_all(
                         &mut stream,
                         &encode_fail(
@@ -383,821 +1340,26 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     )
                     .await
                     .ok();
-                    return Ok(());
                 }
+                return Ok(());
             }
         };
 
         let frame_bytes = frame.as_slice();
 
-        if frame_bytes.is_empty() {
-            if is_lumina {
-                lumina::send_lumina_fail(
-                    &mut stream,
-                    0,
-                    &format!("{}: error: invalid data.\n", cfg.lumina.server_name),
-                )
-                .await?;
-            } else {
-                write_all(
-                    &mut stream,
-                    &encode_fail(
-                        0,
-                        &format!("{}: error: invalid data.\n", cfg.lumina.server_name),
-                    ),
-                )
-                .await?;
-            }
-            continue;
-        }
-
-        let typ = frame_bytes[0];
-        let pld = &frame_bytes[1..];
-
-        debug!(
-            "Incoming message: type=0x{:02x}, payload_size={}",
-            typ,
-            pld.len()
-        );
-
-        if is_lumina {
-            debug!("Lumina command received: 0x{:02x}", typ);
-
-            match typ {
-                0x0e => {
-                    // PullMetadata
-                    let caps = lumina::LuminaCaps {
-                        max_funcs: cfg.limits.max_pull_items,
-                        max_name_bytes: cfg.limits.max_name_bytes,
-                        max_data_bytes: cfg.limits.max_data_bytes,
-                        max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
-                        max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
-                    };
-
-                    let pull_msg = match lumina::parse_lumina_pull_metadata(pld, caps) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Failed to parse Lumina PullMetadata: {}", e);
-                            lumina::send_lumina_fail(&mut stream, 0, "invalid pull").await?;
-                            continue;
-                        }
-                    };
-
-                    // Collect keys in request order
-                    let mut keys: Vec<u128> = Vec::with_capacity(pull_msg.funcs.len());
-                    for func in &pull_msg.funcs {
-                        if func.mb_hash.len() != 16 {
-                            keys.push(0);
-                        } else {
-                            let key = u128::from_be_bytes([
-                                func.mb_hash[0],
-                                func.mb_hash[1],
-                                func.mb_hash[2],
-                                func.mb_hash[3],
-                                func.mb_hash[4],
-                                func.mb_hash[5],
-                                func.mb_hash[6],
-                                func.mb_hash[7],
-                                func.mb_hash[8],
-                                func.mb_hash[9],
-                                func.mb_hash[10],
-                                func.mb_hash[11],
-                                func.mb_hash[12],
-                                func.mb_hash[13],
-                                func.mb_hash[14],
-                                func.mb_hash[15],
-                            ]);
-                            keys.push(key);
-                        }
-                    }
-
-                    let qctx = crate::db::QueryContext {
-                        keys: &keys,
-                        md5: None,
-                        basename: None,
-                        hostname: None,
-                    };
-                    let selected = match db.select_versions_for_batch(&qctx).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("scoring error: {}", e);
-                            // Fallback to legacy latest-per-key
-                            let mut v = Vec::with_capacity(keys.len());
-                            for &k in &keys {
-                                v.push(
-                                    db.get_latest(k)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .map(|f| (f.popularity, f.len_bytes, f.name, f.data)),
-                                );
-                            }
-                            v
-                        }
-                    };
-
-                    let mut maybe_funcs: Vec<Option<(u32, u32, String, Vec<u8>)>> = selected;
-                    let mut statuses: Vec<u32> = maybe_funcs
-                        .iter()
-                        .map(|o| if o.is_some() { 0 } else { 1 })
-                        .collect();
-
-                    METRICS
-                        .queried_funcs
-                        .fetch_add(keys.len() as u64, Ordering::Relaxed);
-
-                    // Upstream fetch for remaining misses
-                    if !cfg.upstreams.is_empty() {
-                        let mut missing_keys = Vec::new();
-                        let mut missing_pos = Vec::new();
-                        for (i, (&k, st)) in keys.iter().zip(statuses.iter()).enumerate() {
-                            if k != 0 && *st == 1 {
-                                missing_keys.push(k);
-                                missing_pos.push(i);
-                            }
-                        }
-                        if !missing_keys.is_empty() {
-                            match crate::upstream::fetch_from_upstreams(
-                                &cfg.upstreams,
-                                &missing_keys,
-                            )
-                            .await
-                            {
-                                Ok(fetched) => {
-                                    let mut new_inserts_owned: Vec<(
-                                        u128,
-                                        u32,
-                                        u32,
-                                        String,
-                                        Vec<u8>,
-                                    )> = Vec::new();
-                                    for (j, item) in fetched.into_iter().enumerate() {
-                                        let idx = missing_pos[j];
-                                        if let Some((pop, len, name, data)) = item {
-                                            statuses[idx] = 0;
-                                            new_inserts_owned.push((
-                                                missing_keys[j],
-                                                pop,
-                                                len,
-                                                name.clone(),
-                                                data.clone(),
-                                            ));
-                                            maybe_funcs[idx] = Some((pop, len, name, data));
-                                        }
-                                    }
-                                    let new_inserts: Vec<(u128, u32, u32, &str, &[u8])> =
-                                        new_inserts_owned
-                                            .iter()
-                                            .map(|(k, p, l, n, d)| {
-                                                (*k, *p, *l, n.as_str(), d.as_slice())
-                                            })
-                                            .collect();
-                                    if !new_inserts.is_empty() {
-                                        match db.push(&new_inserts).await {
-                                            Ok(st) => {
-                                                let new_funcs =
-                                                    st.iter().filter(|&&v| v == 1).count() as u64;
-                                                let updated_funcs =
-                                                    st.iter().filter(|&&v| v == 0).count() as u64;
-                                                METRICS.pushes.fetch_add(
-                                                    new_funcs + updated_funcs,
-                                                    Ordering::Relaxed,
-                                                );
-                                                METRICS
-                                                    .new_funcs
-                                                    .fetch_add(new_funcs, Ordering::Relaxed);
-                                            }
-                                            Err(e) => {
-                                                error!("db push after upstream: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("upstream pull failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    let mut found_list = Vec::new();
-                    for it in maybe_funcs.into_iter() {
-                        if let Some(v) = it {
-                            found_list.push(v);
-                        }
-                    }
-
-                    METRICS
-                        .pulls
-                        .fetch_add(found_list.len() as u64, Ordering::Relaxed);
-                    debug!(
-                        "Lumina PULL response: {} found, {} not found",
-                        found_list.len(),
-                        statuses.iter().filter(|&&s| s == 1).count()
-                    );
-                    lumina::send_lumina_pull_result(&mut stream, &statuses, &found_list).await?;
-                }
-                0x10 => {
-                    // PushMetadata
-                    let caps = lumina::LuminaCaps {
-                        max_funcs: cfg.limits.max_push_items,
-                        max_name_bytes: cfg.limits.max_name_bytes,
-                        max_data_bytes: cfg.limits.max_data_bytes,
-                        max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
-                        max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
-                    };
-
-                    let push_msg = match lumina::parse_lumina_push_metadata(pld, caps) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Failed to parse Lumina PushMetadata: {}", e);
-                            lumina::send_lumina_fail(&mut stream, 0, "invalid push").await?;
-                            continue;
-                        }
-                    };
-
-                    debug!("Lumina PUSH request: {} items", push_msg.funcs.len());
-
-                    // Print push request metadata
-                    println!("\n=== PUSH REQUEST ===");
-                    println!("IDB Path:     {}", push_msg.idb_path);
-                    println!("File Path:    {}", push_msg.file_path);
-                    println!(
-                        "MD5:          {}",
-                        push_msg
-                            .md5
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<String>()
-                    );
-                    println!("Functions:    {}", push_msg.funcs.len());
-                    println!("===================\n");
-
-                    let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> =
-                        Vec::with_capacity(push_msg.funcs.len());
-                    for func in &push_msg.funcs {
-                        if func.hash.len() != 16 {
-                            error!("Invalid hash length: {}", func.hash.len());
-                            continue;
-                        }
-                        let key = u128::from_be_bytes([
-                            func.hash[0],
-                            func.hash[1],
-                            func.hash[2],
-                            func.hash[3],
-                            func.hash[4],
-                            func.hash[5],
-                            func.hash[6],
-                            func.hash[7],
-                            func.hash[8],
-                            func.hash[9],
-                            func.hash[10],
-                            func.hash[11],
-                            func.hash[12],
-                            func.hash[13],
-                            func.hash[14],
-                            func.hash[15],
-                        ]);
-                        inlined.push((key, 0, func.func_len, &func.name, &func.func_data));
-                    }
-
-                    // Extract binary context
-                    let basename = std::path::Path::new(&push_msg.file_path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    let ctx = crate::db::PushContext {
-                        md5: Some(push_msg.md5),
-                        basename: Some(basename),
-                        hostname: Some(push_msg.hostname.as_str()),
-                    };
-
-                    match db.push_with_ctx(&inlined, &ctx).await {
-                        Ok(status) => {
-                            let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
-                            let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
-                            let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
-
-                            METRICS.pushes.fetch_add(
-                                (new_funcs + updated_funcs),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            METRICS
-                                .new_funcs
-                                .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
-
-                            debug!(
-                                "Lumina PUSH response: {} new, {} updated, {} unchanged",
-                                new_funcs, updated_funcs, skipped_funcs
-                            );
-
-                            let lumina_status: Vec<u32> =
-                                status.iter().map(|&s| if s == 2 { 0 } else { 1 }).collect();
-                            lumina::send_lumina_push_result(&mut stream, &lumina_status).await?;
-                        }
-                        Err(e) => {
-                            error!("db push: {}", e);
-                            lumina::send_lumina_fail(
-                                &mut stream,
-                                0,
-                                &format!(
-                                    "{}: db error; please try again later",
-                                    cfg.lumina.server_name
-                                ),
-                            )
-                            .await?;
-                        }
-                    }
-                }
-                0x18 => {
-                    // DelHistory
-                    if !cfg.lumina.allow_deletes {
-                        lumina::send_lumina_fail(
-                            &mut stream,
-                            2,
-                            &format!(
-                                "{}: Delete command is disabled on this server.",
-                                cfg.lumina.server_name
-                            ),
-                        )
-                        .await?;
-                        continue;
-                    }
-                    debug!("Lumina DEL request (not fully implemented)");
-                    lumina::send_lumina_del_result(&mut stream, 0).await?;
-                }
-                0x2f => {
-                    // GetFuncHistories
-                    let caps = lumina::LuminaCaps {
-                        max_funcs: cfg.limits.max_hist_items,
-                        max_name_bytes: cfg.limits.max_name_bytes,
-                        max_data_bytes: cfg.limits.max_data_bytes,
-                        max_cstr_bytes: cfg.limits.lumina_max_cstr_bytes,
-                        max_hash_bytes: cfg.limits.lumina_max_hash_bytes,
-                    };
-
-                    let hist_msg = match lumina::parse_lumina_get_func_histories(pld, caps) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Failed to parse Lumina GetFuncHistories: {}", e);
-                            lumina::send_lumina_fail(&mut stream, 0, "invalid hist").await?;
-                            continue;
-                        }
-                    };
-
-                    debug!("Lumina HIST request: {} keys", hist_msg.funcs.len());
-
-                    let limit = if cfg.lumina.get_history_limit == 0 {
-                        0
-                    } else {
-                        cfg.lumina.get_history_limit
-                    };
-                    if limit == 0 {
-                        lumina::send_lumina_fail(
-                            &mut stream,
-                            4,
-                            &format!(
-                                "{}: function histories are disabled on this server.",
-                                cfg.lumina.server_name
-                            ),
-                        )
-                        .await?;
-                        continue;
-                    }
-
-                    let mut statuses = Vec::new();
-                    let mut histories = Vec::new();
-
-                    for func in &hist_msg.funcs {
-                        if func.mb_hash.len() != 16 {
-                            statuses.push(0);
-                            continue;
-                        }
-                        let key = u128::from_be_bytes([
-                            func.mb_hash[0],
-                            func.mb_hash[1],
-                            func.mb_hash[2],
-                            func.mb_hash[3],
-                            func.mb_hash[4],
-                            func.mb_hash[5],
-                            func.mb_hash[6],
-                            func.mb_hash[7],
-                            func.mb_hash[8],
-                            func.mb_hash[9],
-                            func.mb_hash[10],
-                            func.mb_hash[11],
-                            func.mb_hash[12],
-                            func.mb_hash[13],
-                            func.mb_hash[14],
-                            func.mb_hash[15],
-                        ]);
-
-                        match db.get_history(key, limit).await {
-                            Ok(hist) if !hist.is_empty() => {
-                                statuses.push(1);
-                                let hist_tuples: Vec<(u64, String, Vec<u8>)> = hist
-                                    .into_iter()
-                                    .map(|(ts, name, data)| (ts, name, data))
-                                    .collect();
-                                histories.push(hist_tuples);
-                            }
-                            Ok(_) => {
-                                statuses.push(0);
-                            }
-                            Err(e) => {
-                                error!("db hist: {}", e);
-                                lumina::send_lumina_fail(
-                                    &mut stream,
-                                    3,
-                                    &format!("{}: db error", cfg.lumina.server_name),
-                                )
-                                .await?;
-                                return Ok(());
-                            }
-                        }
-                    }
-
-                    debug!("Lumina HIST response: {} histories found", histories.len());
-                    lumina::send_lumina_histories_result(&mut stream, &statuses, &histories)
-                        .await?;
-                }
-                _ => {
-                    warn!("Unknown Lumina command: 0x{:02x}", typ);
-                    lumina::send_lumina_fail(
-                        &mut stream,
-                        0,
-                        &format!("{}: Unknown command.", cfg.lumina.server_name),
-                    )
-                    .await?;
-                    continue;
+        // Handle command using the appropriate protocol handler
+        match match &handler {
+            ProtocolHandler::Lumina(h) => h.handle_command(&mut stream, frame_bytes, &cfg, &db).await,
+            ProtocolHandler::Legacy(h) => h.handle_command(&mut stream, frame_bytes, &cfg, &db).await,
+        } {
+            Ok(should_continue) => {
+                if !should_continue {
+                    return Ok(());
                 }
             }
-            continue;
-        }
-
-        let msg_start = Instant::now();
-
-        match typ {
-            MSG_PULL => {
-                let keys = match decode_pull(pld, cfg.limits.max_pull_items) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("decode_pull: {:?}", e);
-                        write_all(&mut stream, &encode_fail(0, "invalid pull")).await?;
-                        continue;
-                    }
-                };
-
-                debug!("PULL request: {} keys", keys.len());
-                METRICS
-                    .queried_funcs
-                    .fetch_add(keys.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                let qctx = crate::db::QueryContext {
-                    keys: &keys,
-                    md5: None,
-                    basename: None,
-                    hostname: None,
-                };
-                let selected = match db.select_versions_for_batch(&qctx).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("scoring error: {}", e);
-                        let mut v = Vec::with_capacity(keys.len());
-                        for &k in &keys {
-                            v.push(
-                                db.get_latest(k)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .map(|f| (f.popularity, f.len_bytes, f.name, f.data)),
-                            );
-                        }
-                        v
-                    }
-                };
-
-                let mut maybe_funcs: Vec<Option<(u32, u32, String, Vec<u8>)>> = selected;
-                let mut statuses: Vec<u32> = maybe_funcs
-                    .iter()
-                    .map(|o| if o.is_some() { 0 } else { 1 })
-                    .collect();
-
-                // Upstream fetch for misses
-                if !cfg.upstreams.is_empty() {
-                    let mut missing_keys = Vec::new();
-                    let mut missing_pos = Vec::new();
-                    for (i, (&k, st)) in keys.iter().zip(statuses.iter()).enumerate() {
-                        if *st == 1 {
-                            // Skip keys that are in the failure cache
-                            if !db.failure_cache.is_failed(k) {
-                                missing_keys.push(k);
-                                missing_pos.push(i);
-                            }
-                        }
-                    }
-                    if !missing_keys.is_empty() {
-                        debug!(
-                            "Upstream fetch: {} keys (after filtering failure cache)",
-                            missing_keys.len()
-                        );
-                        match crate::upstream::fetch_from_upstreams(&cfg.upstreams, &missing_keys)
-                            .await
-                        {
-                            Ok(fetched) => {
-                                let mut new_inserts_owned: Vec<(u128, u32, u32, String, Vec<u8>)> =
-                                    Vec::new();
-                                for (j, item) in fetched.into_iter().enumerate() {
-                                    let idx = missing_pos[j];
-                                    let key = missing_keys[j];
-                                    if let Some((pop, len, name, data)) = item {
-                                        statuses[idx] = 0;
-                                        new_inserts_owned.push((
-                                            key,
-                                            pop,
-                                            len,
-                                            name.clone(),
-                                            data.clone(),
-                                        ));
-                                        maybe_funcs[idx] = Some((pop, len, name, data));
-                                    } else {
-                                        // Not found in upstream - add to failure cache
-                                        db.failure_cache.insert(key);
-                                    }
-                                }
-                                let new_inserts: Vec<(u128, u32, u32, &str, &[u8])> =
-                                    new_inserts_owned
-                                        .iter()
-                                        .map(|(k, p, l, n, d)| {
-                                            (*k, *p, *l, n.as_str(), d.as_slice())
-                                        })
-                                        .collect();
-                                if !new_inserts_owned.is_empty() {
-                                    match db.push(&new_inserts).await {
-                                        Ok(st) => {
-                                            let new_funcs =
-                                                st.iter().filter(|&&v| v == 1).count() as u64;
-                                            let updated_funcs =
-                                                st.iter().filter(|&&v| v == 0).count() as u64;
-                                            METRICS.pushes.fetch_add(
-                                                (new_funcs + updated_funcs),
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                            METRICS.new_funcs.fetch_add(
-                                                new_funcs,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("db push after upstream: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("upstream pull failed: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                let mut found = Vec::new();
-                for it in maybe_funcs.into_iter() {
-                    if let Some(v) = it {
-                        found.push(v);
-                    }
-                }
-
-                METRICS
-                    .pulls
-                    .fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                debug!(
-                    "PULL response: {} found, {} not found (took {:?})",
-                    found.len(),
-                    statuses.iter().filter(|&&s| s == 1).count(),
-                    msg_start.elapsed()
-                );
-                write_all(&mut stream, &encode_pull_ok(&statuses, &found)).await?;
-            }
-            MSG_PUSH => {
-                let caps = PushCaps {
-                    max_items: cfg.limits.max_push_items,
-                    max_name_bytes: cfg.limits.max_name_bytes,
-                    max_data_bytes: cfg.limits.max_data_bytes,
-                };
-
-                let items = match decode_push(pld, &caps) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("decode_push: {:?}", e);
-                        write_all(&mut stream, &encode_fail(0, "invalid push")).await?;
-                        continue;
-                    }
-                };
-
-                debug!("PUSH request: {} items", items.len());
-
-                if log_enabled!(log::Level::Debug) {
-                    for (i, item) in items.iter().enumerate().take(5) {
-                        debug!(
-                            "  Item[{}]: key=0x{:032x}, pop={}, len={}, name='{}'",
-                            i, item.key, item.popularity, item.len_bytes, item.name
-                        );
-                        debug!("    Data hex dump:\n{}", hex_dump(&item.data, 128));
-                    }
-                    if items.len() > 5 {
-                        debug!("  ... and {} more items", items.len() - 5);
-                    }
-                }
-
-                let mut inlined: Vec<(u128, u32, u32, &str, &[u8])> =
-                    Vec::with_capacity(items.len());
-                for it in &items {
-                    inlined.push((it.key, it.popularity, it.len_bytes, &it.name, &it.data));
-                }
-
-                let res = db.push(&inlined).await;
-
-                match res {
-                    Ok(status) => {
-                        let new_funcs = status.iter().filter(|&&v| v == 1).count() as u64;
-                        let updated_funcs = status.iter().filter(|&&v| v == 0).count() as u64;
-                        let skipped_funcs = status.iter().filter(|&&v| v == 2).count() as u64;
-                        METRICS.pushes.fetch_add(
-                            new_funcs + updated_funcs,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        METRICS
-                            .new_funcs
-                            .fetch_add(new_funcs, std::sync::atomic::Ordering::Relaxed);
-
-                        // Remove successfully pushed keys from failure cache
-                        for it in &items {
-                            db.failure_cache.remove(it.key);
-                        }
-
-                        debug!(
-                            "PUSH response: {} new, {} updated, {} unchanged (took {:?})",
-                            new_funcs,
-                            updated_funcs,
-                            skipped_funcs,
-                            msg_start.elapsed()
-                        );
-                        write_all(&mut stream, &encode_push_ok(&status)).await?;
-                    }
-                    Err(e) => {
-                        error!("db push: {}", e);
-                        write_all(
-                            &mut stream,
-                            &encode_fail(
-                                0,
-                                &format!(
-                                    "{}: db error; please try again later..\n",
-                                    cfg.lumina.server_name
-                                ),
-                            ),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            MSG_DEL => {
-                if !cfg.lumina.allow_deletes {
-                    write_all(
-                        &mut stream,
-                        &encode_fail(
-                            2,
-                            &format!(
-                                "{}: Delete command is disabled on this server.",
-                                cfg.lumina.server_name
-                            ),
-                        ),
-                    )
-                    .await?;
-                    continue;
-                }
-
-                let keys = match decode_del(pld, cfg.limits.max_del_items) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("decode_del: {:?}", e);
-                        write_all(&mut stream, &encode_fail(0, "invalid del")).await?;
-                        continue;
-                    }
-                };
-
-                debug!("DEL request: {} keys", keys.len());
-
-                match db.delete_keys(&keys).await {
-                    Ok(n) => {
-                        debug!(
-                            "DEL response: {} keys deleted (took {:?})",
-                            n,
-                            msg_start.elapsed()
-                        );
-                        write_all(&mut stream, &encode_del_ok(n)).await?;
-                    }
-                    Err(e) => {
-                        error!("db del: {}", e);
-                        write_all(
-                            &mut stream,
-                            &encode_fail(
-                                3,
-                                &format!(
-                                    "{}: db error, please try again later.",
-                                    cfg.lumina.server_name
-                                ),
-                            ),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            MSG_HIST => {
-                let (limit_req, keys) = match decode_hist(pld, cfg.limits.max_hist_items) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("decode_hist: {:?}", e);
-                        write_all(&mut stream, &encode_fail(0, "invalid hist")).await?;
-                        continue;
-                    }
-                };
-
-                debug!("HIST request: limit={}, {} keys", limit_req, keys.len());
-
-                let limit = if cfg.lumina.get_history_limit == 0 {
-                    0
-                } else {
-                    cfg.lumina.get_history_limit.min(limit_req)
-                };
-                if limit == 0 {
-                    write_all(
-                        &mut stream,
-                        &encode_fail(
-                            4,
-                            &format!(
-                                "{}: function histories are disabled on this server.",
-                                cfg.lumina.server_name
-                            ),
-                        ),
-                    )
-                    .await?;
-                    continue;
-                }
-
-                let mut statuses = Vec::with_capacity(keys.len());
-                let mut logs = Vec::new();
-
-                for k in keys {
-                    match db.get_history(k, limit).await {
-                        Ok(v) if !v.is_empty() => {
-                            statuses.push(1);
-                            logs.push(v);
-                        }
-                        Ok(_) => {
-                            statuses.push(0);
-                        }
-                        Err(e) => {
-                            error!("db hist: {}", e);
-                            write_all(
-                                &mut stream,
-                                &encode_fail(
-                                    3,
-                                    &format!(
-                                        "{}: db error, please try again later.",
-                                        cfg.lumina.server_name
-                                    ),
-                                ),
-                            )
-                            .await?;
-                            continue;
-                        }
-                    }
-                }
-
-                let found_histories = logs.len();
-                debug!(
-                    "HIST response: {} histories found (took {:?})",
-                    found_histories,
-                    msg_start.elapsed()
-                );
-                write_all(&mut stream, &encode_hist_ok(&statuses, &logs)).await?;
-            }
-            _ => {
-                debug!(
-                    "Unknown message type: 0x{:02x}, payload size: {} (took {:?})",
-                    typ,
-                    pld.len(),
-                    msg_start.elapsed()
-                );
-                if log_enabled!(log::Level::Debug) && !pld.is_empty() {
-                    debug!("Unknown message payload hex dump:\n{}", hex_dump(pld, 256));
-                }
-                write_all(
-                    &mut stream,
-                    &encode_fail(0, &format!("{}: invalid data.\n", cfg.lumina.server_name)),
-                )
-                .await?;
+            Err(e) => {
+                error!("Error handling command: {}", e);
+                return Ok(());
             }
         }
     }

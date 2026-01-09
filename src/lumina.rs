@@ -248,6 +248,10 @@ pub struct LuminaGetFuncHistories {
     pub unk0: u32,
 }
 
+pub struct LuminaDelHistory {
+    pub funcs: Vec<LuminaPullMetadataFunc>,
+}
+
 pub fn parse_lumina_pull_metadata(
     payload: &[u8],
     caps: LuminaCaps,
@@ -459,6 +463,42 @@ pub fn parse_lumina_get_func_histories(
     let (unk0, _c) = unpack_dd(&payload[offset..]);
 
     Ok(LuminaGetFuncHistories { funcs, unk0 })
+}
+
+pub fn parse_lumina_del_history(
+    payload: &[u8],
+    caps: LuminaCaps,
+) -> Result<LuminaDelHistory, LuminaError> {
+    let mut offset = 0;
+
+    let (count, c) = unpack_dd(&payload[offset..]);
+    if c == 0 {
+        return Err(LuminaError::UnexpectedEof);
+    }
+    offset += c;
+
+    let n = (count as usize).min(caps.max_funcs);
+    let mut funcs = Vec::with_capacity(n);
+
+    for i in 0..count {
+        let (func_unk0, c) = unpack_dd(&payload[offset..]);
+        if c == 0 {
+            return Err(LuminaError::UnexpectedEof);
+        }
+        offset += c;
+
+        let (hash, c) = unpack_var_bytes_capped(&payload[offset..], caps.max_hash_bytes)?;
+        offset += c;
+
+        if (i as usize) < n {
+            funcs.push(LuminaPullMetadataFunc {
+                unk0: func_unk0,
+                mb_hash: hash.to_vec(),
+            });
+        }
+    }
+
+    Ok(LuminaDelHistory { funcs })
 }
 
 /// Build a Lumina Hello payload (client-side)
