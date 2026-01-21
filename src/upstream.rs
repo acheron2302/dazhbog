@@ -3,6 +3,7 @@ use crate::lumina;
 use crate::metrics::METRICS;
 use log::*;
 use std::io;
+use hex::FromHex;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
@@ -77,16 +78,9 @@ fn parse_license_id(json_str: &str) -> io::Result<[u8; 6]> {
 
     // Directly access the license ID
     if let Some(license_id) = v["payload"]["licenses"][0]["id"].as_str() {
-        let mut lic_id = [0u8; 6];
-        for i in 0..6 {
-            let hex_byte = &license_id[i * 2..i * 2 + 2];
-            lic_id[i] = u8::from_str_radix(hex_byte, 16).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad hex in license ID: {}", e),
-                )
-            })?;
-        }
+        let cleaned_license: String = license_id.chars().filter(|c| c != &'-').collect();
+
+        let lic_id  = <[u8; 6]>::from_hex(&cleaned_license).unwrap();
         debug!(
             "upstream: parsed license ID from '{}'",
             license_id
