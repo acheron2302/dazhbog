@@ -33,6 +33,7 @@ COPY --from=builder /app/target/release/dazhbog /app/dazhbog
 # Copy config and data if needed
 COPY config.toml ./
 COPY data ./data
+COPY license.hexlic ./
 
 # Expose port
 EXPOSE 1235
