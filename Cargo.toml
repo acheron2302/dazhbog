@@ -38,6 +38,7 @@ rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 thiserror = "1.0"
+serde_json = "1.0.149"
 
 [profile.release]
 lto = "fat"

@@ -3,6 +3,7 @@ use crate::lumina;
 use crate::metrics::METRICS;
 use log::*;
 use std::io;
+use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
 
@@ -71,51 +72,26 @@ impl UpstreamConn {
 }
 
 /// Parse license ID from JSON (format: "XX-YYYY-ZZZZ-WW" -> [0xXX, 0xYY, 0xYY, 0xZZ, 0xZZ, 0xWW])
-fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
-    let json_str = std::str::from_utf8(json_data).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("license not UTF-8: {}", e),
-        )
-    })?;
+fn parse_license_id(json_str: &str) -> io::Result<[u8; 6]> {
+    let v: Value = serde_json::from_str(&json_str)?;
 
-    // Find "id" field in licenses array (first occurrence after "licenses")
-    if let Some(licenses_pos) = json_str.find(r#""licenses""#) {
-        let search_from = &json_str[licenses_pos..];
-        // Look for "id" field with optional whitespace: "id": "..."
-        for line in search_from.lines() {
-            if line.contains(r#""id""#) {
-                // Extract value after "id":
-                if let Some(colon_pos) = line.find(':') {
-                    let after_colon = &line[colon_pos + 1..].trim_start();
-                    if after_colon.starts_with('"') {
-                        if let Some(end_quote) = after_colon[1..].find('"') {
-                            let id_str = &after_colon[1..1 + end_quote];
-                            // Parse format like "96-4406-9EB7-5F"
-                            let hex_only: String =
-                                id_str.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-                            if hex_only.len() == 12 {
-                                let mut lic_id = [0u8; 6];
-                                for i in 0..6 {
-                                    let hex_byte = &hex_only[i * 2..i * 2 + 2];
-                                    lic_id[i] = u8::from_str_radix(hex_byte, 16).map_err(|e| {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            format!("bad hex in license ID: {}", e),
-                                        )
-                                    })?;
-                                }
-                                debug!(
-                                    "upstream: parsed license ID from '{}': {:02X?}",
-                                    id_str, lic_id
-                                );
-                                return Ok(lic_id);
-                            }
-                        }
-                    }
-                }
-            }
+    // Directly access the license ID
+    if let Some(license_id) = v["payload"]["licenses"][0]["id"].as_str() {
+        let mut lic_id = [0u8; 6];
+        for i in 0..6 {
+            let hex_byte = &license_id[i * 2..i * 2 + 2];
+            lic_id[i] = u8::from_str_radix(hex_byte, 16).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad hex in license ID: {}", e),
+                )
+            })?;
         }
+        debug!(
+            "upstream: parsed license ID from '{}'",
+            license_id
+        );
+        return Ok(lic_id);
     }
 
     Err(io::Error::new(
@@ -127,35 +103,35 @@ fn parse_license_id(json_data: &[u8]) -> io::Result<[u8; 6]> {
 /// Perform a Lumina hello to upstream.
 /// License is sent as license_data; lic_number is parsed from JSON.
 async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Result<()> {
-    let lic_bytes: Vec<u8> = if let Some(ref path) = up.license_path {
-        std::fs::read(path).map_err(|e| {
+    let lic_str = if let Some(ref path) = up.license_path {
+        std::fs::read_to_string(path).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!("failed to read license file '{}': {}", path, e),
             )
         })?
     } else {
-        Vec::new()
+        String::new()
     };
 
-    let lic_id = if !lic_bytes.is_empty() {
-        parse_license_id(&lic_bytes)?
+    let lic_id = if !lic_str.is_empty() {
+        parse_license_id(&lic_str)?
     } else {
         [0u8; 6]
     };
 
     let payload = lumina::build_lumina_hello_payload(
         up.hello_protocol_version,
-        &lic_bytes,
+        &lic_str.as_bytes(),
         lic_id,
         "guest",
-        "",
+        "guest",
         0,
     );
     debug!(
         "upstream: sending hello (protocol_version={}, license_len={})",
         up.hello_protocol_version,
-        lic_bytes.len()
+        lic_str.len()
     );
     tokio::time::timeout(
         std::time::Duration::from_millis(up.timeout_ms),
@@ -178,18 +154,18 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
 
     // Check for failure response
     if typ == 0x0b {
-        match lumina::decode_lumina_fail(&pl) {
+        return match lumina::decode_lumina_fail(&pl) {
             Ok((code, msg)) => {
-                return Err(io::Error::new(
+                Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!("upstream rejected hello: code={}, message={}", code, msg),
-                ));
+                ))
             }
             Err(_) => {
-                return Err(io::Error::new(
+                Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("upstream rejected hello with type 0x0b (failed to decode message)"),
-                ));
+                    "upstream rejected hello with type 0x0b (failed to decode message)",
+                ))
             }
         }
     }
@@ -209,7 +185,7 @@ async fn upstream_handshake(conn: &mut UpstreamConn, up: &Upstream) -> io::Resul
 /// Tries servers in priority order (lower priority number = higher priority).
 /// Stops querying once all functions are found or all servers are exhausted.
 pub async fn fetch_from_upstreams(
-    upstreams: &[crate::config::Upstream],
+    upstreams: &[Upstream],
     keys: &[u128],
 ) -> io::Result<Vec<UpItem>> {
     if keys.is_empty() {
@@ -305,7 +281,7 @@ pub async fn fetch_from_upstreams(
 
 /// Fetch missing items from a single upstream server. Returns vector aligned to `keys`.
 async fn fetch_from_single_upstream(
-    up: &crate::config::Upstream,
+    up: &Upstream,
     keys: &[u128],
 ) -> io::Result<Vec<UpItem>> {
     if keys.is_empty() {
@@ -368,7 +344,7 @@ async fn fetch_from_single_upstream(
             start = end;
             continue;
         }
-        if let Err(e) = write_result.unwrap() {
+        if let Err(e) = write_result? {
             METRICS
                 .upstream_errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
